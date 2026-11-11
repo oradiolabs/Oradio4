@@ -1,0 +1,83 @@
+# Placeholders will be modified by ../oradio_install.sh script
+
+# WHY THIS UNIT EXISTS, given the udev rule already covers insertion.
+#
+# The udev path arrives well after this one, and typically after oradio.service
+# has started. Not because of unit ordering - basic.target is reached before
+# either - but because systemd-udevd's worker queue is saturated coldplugging
+# the SD card while NetworkManager, avahi-daemon and wpa_supplicant contend for
+# four cores and one SD card. Waiting in that queue is a structural cost no
+# unit-file tuning fixes.
+#
+# This unit sidesteps the queue by probing the raw devtmpfs nodes with blkid
+# instead of waiting for udev to publish a label. That is the whole point; do
+# not "simplify" it away in favour of the udev rule alone.
+#
+# usb-drive.sh logs elapsed milliseconds at each step, so if this path ever
+# slows down enough to lose its lead over the mount consumers, the regression is
+# visible in PLACEHOLDER_LOGFILE_USB.
+
+[Unit]
+Description=USB drive handler (ORADIO) boot fast path
+DefaultDependencies=no
+After=systemd-remount-fs.service
+
+# DefaultDependencies=no drops the implicit shutdown ordering; put it back so a
+# mount is never started into a system that is on its way down.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+# NOTE: there is deliberately no ConditionPathExistsGlob=/dev/sd?1 here.
+#
+# A condition is evaluated once, at whatever moment the job happens to run, with
+# no ordering against USB enumeration and no retry. When it loses that race
+# systemd SKIPS the unit - not fails it, skips it, which reports as "condition
+# failed" and is easy to miss - and the mount falls back to the slow udev path.
+#
+# The script polls for the device itself (DEVICE_WAIT), so a stick that is
+# slightly late is handled rather than written off. When no stick is fitted the
+# script exits 0 rather than failing, so nothing is lost by always running. The
+# poll is bounded and off the critical path: this unit is WantedBy=sysinit.target
+# but nothing is ordered After= it.
+
+[Service]
+# Service runs a single task and then exits.
+Type=oneshot
+
+# Log file permissions applied when the logfile is CREATED. 0002 yields -rw-rw-r-- (0664).
+UMask=0002
+
+# Redirect stdout (fd 1) and stderr (fd 2) to the log file.
+#
+# This takes the script's output OUT of the journal: journalctl -u
+# usb-drive-boot shows only systemd's own start/finish lines. Deliberate - the
+# journal is Storage=volatile and is lost on every reboot, so the log file is
+# the only record that survives.
+#
+# Note stderr is unbuffered while bash block-buffers stdout to a file, so a
+# run's error messages appear ABOVE its own log lines rather than in sequence.
+StandardOutput=append:PLACEHOLDER_LOGFILE_USB
+StandardError=append:PLACEHOLDER_LOGFILE_USB
+
+# PLACEHOLDER_LOGFILE_USB ownership is NOT fixed here.
+# systemd opens StandardOutput= as root, so a deleted PLACEHOLDER_LOGFILE_USB
+# returns root:root and logrotate can no longer rotate it - but usb-drive.sh
+# already runs as root in both units and does the chown itself, at the top,
+# before its lock. One copy for both units, and no extra fork on the fast path.
+
+# 'boot', not 'add': tells the script a missing stick is a normal condition here
+# and must exit 0, whereas the udev-triggered 'add' means udev already saw an
+# ORADIO label, so not finding it is a real error worth reporting.
+ExecStart=/usr/local/sbin/usb-drive.sh boot
+TimeoutStartSec=60
+
+# Keep the unit "active" after the script exits, so systemctl status reflects
+# that the check ran this boot rather than showing it as dead.
+RemainAfterExit=yes
+
+# Do NOT add ProtectSystem=, PrivateTmp=, ProtectHome= or similar sandboxing
+# here. They place the service in a private mount namespace, and the mount would
+# then be invisible to every other process on the system.
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+
+  ####   #####     ##    #####      #     ####
+ #    #  #    #   #  #   #    #     #    #    #
+ #    #  #    #  #    #  #    #     #    #    #
+ #    #  #####   ######  #    #     #    #    #
+ #    #  #   #   #    #  #    #     #    #    #
+  ####   #    #  #    #  #####      #     ####
+
+Created on December 23, 2024
+@author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+@copyright:     Copyright 2024, Oradio Stichting
+@license:       GNU General Public License (GPL)
+@organization:  Oradio Stichting
+@version:       1
+@email:         oradioinfo@stichtingoradio.nl
+@status:        Development
+@summary:       Defines for Oradio scripts
+"""
+from pathlib import Path
+
+##### SHARED WITH INSTALLER ###############################
+# Values below are read from constants.env, which oradio_install.sh
+# also sources. Edit that file, not this one.
+#
+# These are here for a different reason than the rest of this module. The rest
+# holds constants that more than one module uses; a value only one module needs
+# is a local constant and belongs in that module. The values below may well have
+# a single Python consumer -- what they share is a shell script or a config file
+# that needs the same value, and _load_env() below is the only reader of
+# constants.env in the codebase. Putting them in their own module would mean
+# duplicating that reader, or reaching into _ENV from outside.
+def _load_env(path):
+    values = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+# constants.py lives in Main/, so the project root is two levels up.
+# This is the same directory oradio_install.sh calls SCRIPT_PATH.
+_ROOT = Path(__file__).resolve().parent.parent
+_ENV = _load_env(_ROOT / "constants.env")
+
+##### SYSTEM ##############################################
+
+# Paths, derived the same way the installer derives them
+SOUNDS_PATH = str(_ROOT / "system_sounds")
+
+# Colors
+BLUE    = '\x1b[38;5;039m'
+GREY    = '\x1b[38;5;248m'
+WHITE   = '\x1b[38;5;255m'
+YELLOW  = '\x1b[38;5;226m'
+GREEN   = '\x1b[38;5;048m'
+RED     = '\x1b[38;5;196m'
+MAGENTA = '\x1b[38;5;201m'
+NC      = '\x1b[0m'
+
+##### LED definitions see UML «led_name» ##################
+LED_PLAY    = "LedPlay"
+LED_STOP    = "LedStop"
+LED_PRESET1 = "LedPreset1"
+LED_PRESET2 = "LedPreset2"
+LED_PRESET3 = "LedPreset3"
+LED_NAMES   = [LED_PLAY, LED_STOP, LED_PRESET1, LED_PRESET2, LED_PRESET3]
+
+# Blink cycle for "the Oradio cannot run": no usable power supply, no USB drive
+# to play from, an unrecoverable state, or a crash a reboot did not fix. Shared
+# with oradio-crash.sh, which blinks the same pin once this process is gone --
+# see constants.env for why it lives there rather than in either file.
+ERROR_BLINK_CYCLE = float(_ENV["ERROR_BLINK_CYCLE"])
+
+
+# BCM pin of the STOP/OFF LED. In constants.env because oradio-crash.sh drives
+# the same pin once this process is gone; the other four LEDs are Python-only
+# and stay in gpio_service.
+LED_STOP_PIN = int(_ENV["LED_STOP_PIN"])
+
+##### #BUTTON definitions see UML «button_name» ###########
+BUTTON_PLAY        = "ButtonPlay"
+BUTTON_STOP        = "ButtonStop"
+BUTTON_PRESET1     = "ButtonPreset1"
+BUTTON_PRESET2     = "ButtonPreset2"
+BUTTON_PRESET3     = "ButtonPreset3"
+BUTTON_NAMES       = [BUTTON_PLAY, BUTTON_STOP, BUTTON_PRESET1, BUTTON_PRESET2, BUTTON_PRESET3]
+BUTTON_PRESSED     = "button pressed"
+BUTTON_RELEASED    = "button released"
+BUTTON_SHORT_PRESS = "Short press:"
+BUTTON_LONG_PRESS  = "Long press:"
+
+##### SYSTEM SOUND NAMES ##################################
+SOUND_START        = "Start"
+SOUND_STOP         = "Stop"
+SOUND_PLAY         = "PLAY"
+SOUND_CLICK        = "Click"
+SOUND_NEXT         = "Next"
+SOUND_PRESET1      = "Preset1"
+SOUND_PRESET2      = "Preset2"
+SOUND_PRESET3      = "Preset3"
+SOUND_USB_PRESENT  = "USBPresent"
+SOUND_USB_ABSENT   = "USBAbsent"
+SOUND_AP_START     = "OradioAPstarted"
+SOUND_AP_STOP      = "OradioAPstopped"
+SOUND_WIFI         = "WifiConnected"
+SOUND_NO_WIFI      = "WifiNotConnected"
+SOUND_NO_INTERNET  = "NoInternet"
+SOUND_NEW_PRESET   = "NewPlaylistPreset"
+SOUND_NEW_WEBRADIO = "NewPlaylistWebradio"
+SOUND_POWER_ERROR  = "OradioPowerError"
+SOUND_ORADIO_ERROR = "ServiceRequired"
+SOUND_PRESET_EMPTY = "PresetEmpty"
+
+##### REMOTE SERVER #######################################
+RMS_SERVER_URL = _ENV["RMS_SERVER_URL"]
+RMS_SERVER_KEY = _ENV["RMS_SERVER_KEY"]
+
+##### WIFI SERVICE ########################################
+# Access point
+ACCESS_POINT_HOST = "108.156.60.1"  # wsj.com
+ACCESS_POINT_SSID = "OradioAP"
+
+##### WEB SERVICE #########################################
+# Web server address
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = 8000
+# Requests from web_server (FastAPI) to web_service
+REQUEST_CONNECT = "connect to wifi network"
+REQUEST_STOP    = "stop web service"
+
+##### SOUND ###############################################
+
+# ALSA input PCM for spoken prompts and tones. In constants.env because
+# asound.conf defines it and oradio-crash.sh plays through it.
+SYSTEM_SOUND_SINK = _ENV["SYSTEM_SOUND_SINK"]
+
+##### WEB SERVICE #########################################
+
+# dnsmasq config that points every hostname at the captive portal. In
+# constants.env because oradio-crash.sh removes it after a crash that stopped
+# web_service from doing so itself.
+DNS_REDIRECT_CONF = _ENV["DNS_REDIRECT_CONF"]
+
+##### LOG FILES ###########################################
+# Where the Oradio logs, and the names of the logs written from Python. In
+# constants.env with the names of all the other logs, which shell scripts and
+# templates write; see there.
+LOGGING_PATH = _ROOT / _ENV["LOG_DIR"]
+LOG_ORADIO   = _ENV["LOG_ORADIO"]
+LOG_RMS      = _ENV["LOG_RMS"]
+
+##### USB #################################################
+USB_MOUNT_POINT = _ENV["USB_MOUNT_POINT"]
+USB_MUSIC       = USB_MOUNT_POINT + "/Muziek"
+USB_SYSTEM      = USB_MOUNT_POINT + "/Systeem"
+
+##### AUDIO ###############################################
+PRESETS_FILE = USB_SYSTEM + "/presets.json"

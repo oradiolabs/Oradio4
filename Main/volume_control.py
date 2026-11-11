@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""
+  ####   #####     ##    #####      #     ####
+ #    #  #    #   #  #   #    #     #    #    #
+ #    #  #    #  #    #  #    #     #    #    #
+ #    #  #####   ######  #    #     #    #    #
+ #    #  #   #   #    #  #    #     #    #    #
+  ####   #    #  #    #  #####      #     ####
+
+Created on January 27, 2025
+@author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+@copyright:     Copyright 2024, Oradio Stichting
+@license:       GNU General Public License (GPL)
+@organization:  Oradio Stichting
+@version:       2
+@email:         oradioinfo@stichtingoradio.nl
+@status:        Development
+@summary: Oradio Volume Control
+    Tracks the analog volume knob via the MCP3021 ADC over I2C, maps its
+    position to a percentage, and updates the ALSA master volume control
+    whenever the knob moves significantly. Also sets the initial default
+    volumes for MPD and system sounds. Publishes a single
+    volume-changed message per "turn" of the knob. Notifications are
+    automatically disarmed while the knob is moving and re-armed once it
+    settles, so other components can react to knob movement without
+    polling it themselves and without being flooded during a single turn.
+"""
+##### Oradio modules ######################################
+from time import monotonic
+
+from singleton import singleton
+from log_service import oradio_log
+from i2c_service import I2CService
+from utilities import run_shell_script, ThreadTemplate, fatal_exit
+from messaging import (
+    Commands,
+    Incidents,
+    CommandMessage,
+    IncidentMessage,
+    VOLUME_SOURCE,
+    VOLUME_CHANGED,
+    VOLUME_START_FAILED,
+    VOLUME_SET_FAILED,
+    VOLUME_STOPPED,
+)
+
+##### LOCAL constants #####################################
+# Volume scaling and clamping units
+ADC_MIN   = 0
+ADC_MAX   = 1023
+VOL_MIN   = "50%"       # 104
+VOL_MAX   = "100%"      # 207
+
+# ALSA volume controls
+VOLUME_CONTROL_MPD       = "VolumeMPD"
+VOLUME_CONTROL_SYS_SOUND = "VolumeSysSound"
+VOLUME_CONTROL_MASTER    = "Digital Playback Volume"
+
+# Window over which failed amixer calls are counted, per ALSA control. Long
+# enough that the calls of one knob turn fall inside it, so a single turn that
+# misses once reads as 1 and a control that is simply not there reads as every
+# call to it since.
+#
+# Per control, not one count for all: a knob step sets the master control and
+# then VolumeSysSound. The master is a hardware control that keeps working when
+# the softvol controls are missing, so with a single shared count its success
+# on every step would wipe the failure of the other, and the limit below could
+# never be reached in exactly the case it is meant for.
+SET_FAILURE_WINDOW = 60.0  # seconds
+
+# Failures of one control inside that window before the Oradio asks to be
+# restarted. A successful call to that control clears its count, so these are
+# consecutive failures.
+#
+# Deliberately generous, because nobody has measured this yet. A control that
+# is simply not there fails on every step of every knob turn, so it reaches
+# this within a few turns -- while a turn that misses once or twice, which is
+# the case that must not escalate, stays an order of magnitude below it.
+#
+# Every failure is logged with its count either way. Once the field data says
+# how often amixer really misses, this is the number to bring down.
+SET_FAILURE_LIMIT = 20
+
+# Default source volume levels
+DEFAULT_VOLUME_MPD       = "100%"
+DEFAULT_VOLUME_SYS_SOUND = "90%"
+# Level at which the sys_sound level is kept flat by reducing the Volume_sys_sound channel
+VOLUME_SYS_SOUND_FLAT    = "70%"
+
+# MCP3021 - A/D Converter
+MCP3021_ADDRESS      = 0x4D
+READ_DATA_REGISTER   = 0x00
+ADC_UPDATE_TOLERANCE = 5
+POLLING_MIN_INTERVAL = 0.05
+POLLING_MAX_INTERVAL = 0.3
+POLLING_STEP         = 0.01
+# Poll interval while the ADC is not answering. A dead or flaky ADC must not be
+# hammered at the fast-turning rate: every failed poll is three bus attempts.
+POLLING_FAIL_INTERVAL = 1.0
+
+# Dedicated idle timeout (seconds) with no significant knob movement before
+# VOLUME_CHANGED notifications are re-armed. Can be tuned on its own for how
+# quickly a user should notice a response after starting to turn the knob again.
+REARM_IDLE_SECONDS = 1.0
+
+@singleton
+class VolumeControl(ThreadTemplate):
+    """
+    Singleton tracking ADC volume knob, updating on significant volume changes.
+
+    Built on ThreadTemplate, which provides the restartable
+    setup()/do_work()/teardown() background-thread machinery (safe_start(),
+    safe_stop(), crash detection, etc.), so this class only needs to implement
+    the volume-specific behaviour: setup() establishes the starting knob
+    position, do_work() is one polling iteration, and the adaptive polling
+    interval (fast while the knob is turning, slow while idle) is implemented
+    by mutating self._interval from within do_work().
+    """
+
+    # Restart itself if it crashes; see ThreadTemplate.restart_on_crash.
+    # Without it the volume knob stops working, which the user notices immediately.
+    restart_on_crash = True
+
+    def __init__(self) -> None:
+        """
+        Initialise the ThreadTemplate base, default volume levels and the
+        I²C service.
+
+        Construction only sets up internal state; the background polling
+        thread is not started until start() is called explicitly, mirroring
+        ThreadTemplate's own separation between construction and
+        safe_start(). This lets callers control exactly when polling
+        begins (and stop()/start() again later) rather than having it
+        begin as a side effect of construction.
+        """
+        # interval is controlled in setup() and do_work(); called first so
+        # ThreadTemplate's own state exists before any subsequent hardware
+        # I/O below could plausibly fail partway through.
+        super().__init__(name="VolumeControl")
+
+        # Per ALSA control: timestamps of failed amixer calls inside
+        # SET_FAILURE_WINDOW. Before the first _set_volume() below, which
+        # already uses it.
+        self._set_failures: dict[str, list[float]] = {}
+
+        # Set default MPD volume
+        self._set_volume(VOLUME_CONTROL_MPD, DEFAULT_VOLUME_MPD)
+
+        # Set default system sounds volume
+        self._set_volume(VOLUME_CONTROL_SYS_SOUND, DEFAULT_VOLUME_SYS_SOUND)
+
+        # Get I2C r/w methods
+        self._i2c_service = I2CService()
+
+        # Arm notification so the first volume change triggers a message.
+        # Automatically disarmed after a change and re-armed once the knob
+        # settles again (see do_work()).
+        self._armed = True
+
+        # Last-seen ADC value, carried across do_work() calls;
+        # (re)established in setup() at the start of each run.
+        self._previous_adc: int = 0
+
+        # Accumulated idle time (seconds) with no significant knob movement,
+        # used to re-arm notifications independently of the polling backoff.
+        # (Re)established in setup() at the start of each run.
+        self._idle_seconds: float = 0.0
+
+##### Helpers #############################################
+
+    def _read_adc(self) -> int | None:
+        """
+        Read a 10-bit value from the MCP3021 ADC.
+
+        Returns:
+            ADC value in range 0..1023, or None if reading fails.
+        """
+        # Get ADC value - volume knob position
+        data = self._i2c_service.read_block(MCP3021_ADDRESS, READ_DATA_REGISTER, 2)
+        if not data:
+            return None
+
+        # Combine the 2 bytes into a 10-bit value
+        return ((data[0] & 0x3F) << 6) | (data[1] >> 2)
+
+    def _adc2volume(self, adc: int) -> int:
+        """
+        Map ADC value from range [ADC_MIN, ADC_MAX] to [VOL_MIN, VOL_MAX].
+        Result is clamped to 0..100 and rounded to the nearest integer.
+
+        Args:
+            adc: ADC reading representing the volume knob position.
+
+        Returns:
+            Volume level in the range [VOL_MIN, VOL_MAX] (currently 50..100).
+        """
+        raw = int(VOL_MIN[:-1]) + (adc - ADC_MIN) * (int(VOL_MAX[:-1]) - int(VOL_MIN[:-1])) / (ADC_MAX - ADC_MIN)
+        return max(0, min(100, round(raw)))
+
+    def _set_volume(self, control: str, volume: str) -> None:
+        """
+        Change volume for the given ALSA control.
+
+        Args:
+            control: The ALSA volume control to update.
+            volume: The volume to set as a percentage string (e.g. "75%").
+                    Must be in the range 0..100; negative values are rejected.
+        """
+        # Check if volume is given as percentage and in 0..100 range
+        if not (isinstance(volume, str) and volume.endswith('%') and volume[:-1].isdigit() and 0 <= int(volume[:-1]) <= 100):
+            oradio_log.error("Invalid volume '%s'", volume)
+            return
+
+        # Set volume
+        cmd = f"amixer -c 0 cset name='{control}' {volume}"
+        result, response = run_shell_script(cmd)
+        if not result:
+            self._count_set_failure(control, response)
+        else:
+            # Only this control's count: another control working says nothing
+            # about whether this one exists.
+            self._set_failures.pop(control, None)
+            oradio_log.trace("Volume of '%s' set to: %s", control, volume)
+
+    def _count_set_failure(self, control: str, response: str) -> None:
+        """
+        Record a failed amixer call and report it.
+
+        Args:
+            control:  The ALSA control that could not be set.
+            response: What amixer said.
+
+        Counted rather than simply reported, because this runs on every step of
+        a knob turn and there is no retry in front of it. One miss during a turn
+        says nothing; a run of them says the control is not there, which usually
+        means alsactl restore failed at boot and the softvol controls were never
+        created.
+
+        Counted per control, and only a successful call to that same control
+        clears its count -- see SET_FAILURE_WINDOW for why one shared count
+        never reached the limit.
+
+        The count is what the incident carries, and it is the measurement this
+        is here for: nobody knows yet how often amixer misses in the field.
+        Reaching SET_FAILURE_LIMIT ends the process, so oradio-prestart.sh runs
+        its conditional alsactl restore and recreates the controls; the limit is
+        generous until that measurement says where it belongs.
+
+        Every failure is reported either way. The count is what lets a stream
+        of them be told from a single one.
+        """
+        now = monotonic()
+        window_start = now - SET_FAILURE_WINDOW
+        recent = [t for t in self._set_failures.get(control, []) if t >= window_start]
+        recent.append(now)
+        self._set_failures[control] = recent
+
+        oradio_log.error(
+            "Error setting volume of '%s': %s (%d failure(s) within %.0fs)",
+            control, response, len(recent), SET_FAILURE_WINDOW,
+        )
+        Incidents.publish(IncidentMessage(
+            VOLUME_SOURCE, VOLUME_SET_FAILED,
+            details=f"control={control} failures={len(recent)} within {SET_FAILURE_WINDOW:.0f}s: {response}",
+        ))
+
+        if len(recent) >= SET_FAILURE_LIMIT:
+            # Only a process restart can repair this. oradio-prestart.sh checks
+            # whether the softvol controls exist and runs alsactl restore when
+            # they do not, which is the one thing that recreates them -- and the
+            # usual reason they are missing is that very restore failing at boot.
+            # Restarting this subsystem would only repeat the same amixer call.
+            #
+            # fatal_exit() gets there by the ladder that already exists: systemd
+            # restarts the service, and the crash handler reboots if that start
+            # fails too. The music stops, which is the right trade at this point
+            # -- a volume knob that does nothing makes the Oradio nearly unusable
+            # anyway, and by now it has failed SET_FAILURE_LIMIT times.
+            fatal_exit(
+                f"Volume control unusable: {len(recent)} amixer failures for "
+                f"'{control}' within "
+                f"{SET_FAILURE_WINDOW:.0f}s",
+                stacklevel=4,
+            )
+
+    def _calculate_sys_sound_volume(self, master_volume: int) -> int:
+        """
+        Calculate the system-sound volume corresponding to the given master
+        volume.
+
+        The system-sound volume remains at DEFAULT_VOLUME_SYS_SOUND until the
+        master volume exceeds VOLUME_SYS_SOUND_FLAT. Above that threshold, the
+        system-sound volume is reduced one percentage point for every percentage
+        point the master volume increases.
+
+        Args:
+            master_volume: Master volume in the range 0..100.
+
+        Returns:
+            System-sound volume in the range 0..100.
+        """
+        default_volume = int(DEFAULT_VOLUME_SYS_SOUND.removesuffix("%"))
+        flat_threshold = int(VOLUME_SYS_SOUND_FLAT.removesuffix("%"))
+
+        reduction = max(0, master_volume - flat_threshold)
+
+        return max(0, min(100, default_volume - reduction))
+
+    def _set_master_volume(self, volume: int) -> None:
+        """
+        Set the master volume and update all dependent volume controls.
+
+        The master volume is the reference level for the entire audio system.
+        Whenever it changes, the system-sound channel is adjusted to maintain
+        consistent notification loudness.
+
+        Args:
+            volume: Master volume in the range 0..100.
+        """
+        # Update the ALSA master volume to match the requested level.
+        self._set_volume(VOLUME_CONTROL_MASTER, f"{volume}%")
+
+        # The system-sound channel is intentionally attenuated above
+        # VOLUME_SYS_SOUND_FLAT so notification sounds do not become
+        # excessively loud as the master volume approaches 100%.
+        sys_sound_volume = self._calculate_sys_sound_volume(volume)
+        self._set_volume(VOLUME_CONTROL_SYS_SOUND, f"{sys_sound_volume}%")
+
+        oradio_log.debug(
+            "Master volume set to %d%%, system sound volume set to %d%%",
+            volume,
+            sys_sound_volume,
+        )
+
+##### ThreadTemplate overrides ############################
+
+    def setup(self) -> None:
+        """
+        One-time init for this run: read the knob's current position and set
+        the master volume to match it before polling begins. Also (re)sets
+        the polling interval to its slow/idle starting value and clears the
+        dedicated re-arm idle timer.
+
+        Raises:
+            RuntimeError: If the initial ADC read fails, since the volume
+                manager cannot start without a valid starting position.
+                ThreadTemplate.run() catches this, logs it, and stores it
+                on .exception rather than letting it escape.
+        """
+        previous_adc = self._read_adc()
+        if previous_adc is None:
+            raise RuntimeError("ADC read failed on startup, volume manager cannot start")
+        self._previous_adc = previous_adc
+
+        # Initialise the audio subsystem to match the current position of the volume knob
+        volume = self._adc2volume(previous_adc)
+        self._set_master_volume(volume)
+
+        # Start with 'slow' polling
+        self._interval = POLLING_MAX_INTERVAL
+
+        # Reset the dedicated re-arm idle timer for this run
+        self._idle_seconds = 0.0
+
+    def do_work(self) -> None:
+        """
+        One polling iteration: read the knob, update the master volume on a
+        significant change, and adapt the polling interval: fast while the
+        knob is turning, easing back down to idle otherwise.
+
+        Only one VOLUME_CHANGED message is published per "turn": the first
+        significant change disarms further notifications, and they are
+        automatically re-armed once the knob has been idle (no significant
+        movement) for REARM_IDLE_SECONDS. This idle timer is dedicated and
+        independent of the polling backoff curve, so the re-arm delay can be
+        tuned on its own without affecting polling responsiveness. This
+        avoids flooding VOLUME_CHANGED messages while the knob is still
+        being turned, without needing an external caller to re-arm it.
+
+        The adaptive interval is implemented by mutating self._interval;
+        ThreadTemplate's run() loop reads it fresh after each do_work() call
+        to decide how long to wait before the next one.
+        """
+        adc_value = self._read_adc()
+        if adc_value is None:
+            # I2CService has logged it and published the incident (once per
+            # fault). Back off: returning with the interval unchanged kept a
+            # failure during fast polling at 20 polls a second for good.
+            oradio_log.debug("ADC read failed; next poll in %.1fs", POLLING_FAIL_INTERVAL)
+            self._interval = POLLING_FAIL_INTERVAL
+            return
+
+        # Check if knob moved significantly
+        if abs(adc_value - self._previous_adc) > ADC_UPDATE_TOLERANCE:
+            self._previous_adc = adc_value
+
+            # Convert ADC reading to volume level
+            volume = self._adc2volume(adc_value)
+
+            # Convert the knob position into a master-volume percentage
+            # and update every volume control derived from it
+            self._set_master_volume(volume)
+
+            # Disarmed until the knob settles again, preventing repeated
+            # notifications while it's still being turned.
+            if self._armed:
+                self._armed = False
+                oradio_log.debug("Send volume changed message")
+                Commands.publish(CommandMessage(VOLUME_SOURCE, VOLUME_CHANGED))
+
+            # Movement detected: reset the idle timer and poll fast again.
+            self._idle_seconds = 0.0
+            self._interval = POLLING_MIN_INTERVAL     # Fast polling while turning
+        else:
+            # No significant movement this cycle: accumulate the real time
+            # elapsed since the previous poll (i.e. the interval we just
+            # waited) toward the dedicated re-arm idle timer.
+            self._idle_seconds += self._interval
+
+            # Re-arm once the knob has been idle for the dedicated timeout,
+            # independent of where the polling backoff curve currently is.
+            if not self._armed and self._idle_seconds >= REARM_IDLE_SECONDS:
+                self._armed = True
+                oradio_log.debug("Volume knob settled, notifications re-armed")
+
+            self._interval = min(self._interval + POLLING_STEP, POLLING_MAX_INTERVAL)
+
+    def on_stopped(self) -> None:
+        """Report incident: Oradio never intentionally stops volume control."""
+        Incidents.publish(
+            IncidentMessage(VOLUME_SOURCE, VOLUME_STOPPED, details=self.stop_reason())
+        )
+
+##### Public API ##########################################
+
+    def start(self) -> None:
+        """
+        Start the background polling thread.
+
+        Thin wrapper around ThreadTemplate.safe_start() that preserves this
+        class's original public API. Idempotent: calling start() when the
+        thread is already alive is a no-op.
+        """
+        if self.is_alive():
+            oradio_log.debug("Volume manager thread already running")
+            return
+
+        if not self.safe_start():
+            oradio_log.error("Volume manager thread failed to start")
+            Incidents.publish(IncidentMessage(VOLUME_SOURCE, VOLUME_START_FAILED))
+            return
+
+        if self.crashed:
+            oradio_log.error("Volume manager thread crashed during startup: %s", self.exception)
+            Incidents.publish(IncidentMessage(VOLUME_SOURCE, VOLUME_START_FAILED))
+            return
+
+        oradio_log.info("Volume manager thread started")
+
+    def stop(self) -> None:
+        """
+        Signal the background polling thread to stop and wait for it to exit.
+
+        Thin wrapper around ThreadTemplate.safe_stop() that preserves this
+        class's original public API. The stop incident itself is published
+        by on_stopped(), which runs once the worker has ended for good.
+        """
+        self.safe_stop()
+
+##### Stand-alone entry point #############################
+
+if __name__ == "__main__":
+
+    # Imports only relevant when stand-alone
+    from constants import YELLOW, NC
+    from utilities import input_prompt              # pylint: disable=ungrouped-imports
+    from messaging import DebugMessageHandler       # pylint: disable=ungrouped-imports
+
+    # Most modules use similar code in stand-alone
+    # pylint: disable=duplicate-code
+
+    def interactive_menu():
+        """
+        Run an interactive self-test menu for the volume control.
+        """
+
+        # Show menu with test options
+        input_selection = (
+            "\nSelect a function, input the number.\n"
+            " 0-Quit\n"
+            " 1-Start volume control\n"
+            " 2-Stop volume control\n"
+            "Select: "
+        )
+
+        # Initialise volume control
+        volume_control = VolumeControl()
+
+        while True:
+            test_choice = input_prompt(input_selection, int, -1)
+            match test_choice:
+                case 0:
+                    break
+                case 1:
+                    print("\nStarting volume control...")
+                    print("Turn volume knob to observe changes")
+                    volume_control.start()
+                case 2:
+                    print("\nStopping volume control...")
+                    volume_control.stop()
+                case _:
+                    print(f"\n{YELLOW}Please input a valid number{NC}\n")
+
+    print("\nStarting test program...\n")
+
+    # Subscribe to command and error topics so published messages are printed to console
+    command_handler = DebugMessageHandler(Commands.subscribe())
+    incident_handler = DebugMessageHandler(Incidents.subscribe())
+
+    # Launch the interactive test menu; blocks until the user quits
+    interactive_menu()
+
+    # Stop receiving messages
+    Commands.unsubscribe(command_handler.get_queue())
+    Incidents.unsubscribe(incident_handler.get_queue())
+    # Signal the thread to exit and confirm it has exited
+    command_handler.stop()
+    incident_handler.stop()
+
+    print("\nExiting test program...\n")
+
+    # Restore temporarily disabled pylint duplicate code check
+    # pylint: enable=duplicate-code

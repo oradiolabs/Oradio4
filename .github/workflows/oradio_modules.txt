@@ -1,0 +1,11 @@
+nmcli
+pydevd
+smbus2
+jinja2
+fastapi
+uvicorn
+requests
+watchdog
+python-mpd2
+python-multipart
+concurrent-log-handler

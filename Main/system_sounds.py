@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+  ####   #####     ##    #####      #     ####
+ #    #  #    #   #  #   #    #     #    #    #
+ #    #  #    #  #    #  #    #     #    #    #
+ #    #  #####   ######  #    #     #    #    #
+ #    #  #   #   #    #  #    #     #    #    #
+  ####   #    #  #    #  #####      #     ####
+
+Created on January 30, 2025
+@author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+@copyright:     Copyright 2024, Oradio Stichting
+@license:       GNU General Public License (GPL)
+@organization:  Oradio Stichting
+@version:       1
+@email:         oradioinfo@stichtingoradio.nl
+@status:        Development
+@summary:       Oradio System Sound Player
+"""
+import subprocess
+from pathlib import Path
+from threading import Thread, Lock
+
+##### Oradio modules ######################################
+from log_service import oradio_log
+from messaging import (
+    Incidents,
+    IncidentMessage,
+    SOUND_SOURCE,
+    SOUND_MISSING_DIR,
+    SOUND_MISSING_FILE,
+    SOUND_PLAYBACK_FAILED,
+)
+
+##### GLOBAL constants ####################################
+from constants import (
+    SYSTEM_SOUND_SINK,
+    SOUNDS_PATH,
+    SOUND_START,
+    SOUND_STOP,
+    SOUND_PLAY,
+    SOUND_CLICK,
+    SOUND_NEXT,
+    SOUND_PRESET1,
+    SOUND_PRESET2,
+    SOUND_PRESET3,
+    SOUND_USB_PRESENT,
+    SOUND_USB_ABSENT,
+    SOUND_AP_START,
+    SOUND_AP_STOP,
+    SOUND_WIFI,
+    SOUND_NO_WIFI,
+    SOUND_NO_INTERNET,
+    SOUND_NEW_PRESET,
+    SOUND_NEW_WEBRADIO,
+    SOUND_POWER_ERROR,
+    SOUND_ORADIO_ERROR,
+    SOUND_PRESET_EMPTY,
+)
+
+##### LOCAL constants #####################################
+
+# Sound key -> system sound file
+SOUND_FILES = {
+    # Sounds
+    SOUND_START: f"{SOUNDS_PATH}/StartUp.wav",
+    SOUND_STOP:  f"{SOUNDS_PATH}/UIT.wav",
+    SOUND_PLAY:  f"{SOUNDS_PATH}/AAN.wav",
+    SOUND_CLICK: f"{SOUNDS_PATH}/click.wav",
+    # Announcements
+    SOUND_NEXT:         f"{SOUNDS_PATH}/Next_melding.wav",
+    SOUND_PRESET1:      f"{SOUNDS_PATH}/Preset1_melding.wav",
+    SOUND_PRESET2:      f"{SOUNDS_PATH}/Preset2_melding.wav",
+    SOUND_PRESET3:      f"{SOUNDS_PATH}/Preset3_melding.wav",
+    SOUND_USB_PRESENT:  f"{SOUNDS_PATH}/USBPresent_melding.wav",
+    SOUND_USB_ABSENT:   f"{SOUNDS_PATH}/USBAbsent_melding.wav",
+    SOUND_AP_START:     f"{SOUNDS_PATH}/OradioAPstarted_melding.wav",
+    SOUND_AP_STOP:      f"{SOUNDS_PATH}/OradioAPstopped_melding.wav",
+    SOUND_WIFI:         f"{SOUNDS_PATH}/WifiConnected_melding.wav",
+    SOUND_NO_WIFI:      f"{SOUNDS_PATH}/WifiNotConnected_melding.wav",
+    SOUND_NO_INTERNET:  f"{SOUNDS_PATH}/NoInternet_melding.wav",
+    SOUND_NEW_PRESET:   f"{SOUNDS_PATH}/NewPlaylistPreset_melding.wav",
+    SOUND_NEW_WEBRADIO: f"{SOUNDS_PATH}/NewPlaylistWebradio_melding.wav",
+    SOUND_POWER_ERROR:  f"{SOUNDS_PATH}/OradioPowerError_melding.wav",
+    SOUND_ORADIO_ERROR: f"{SOUNDS_PATH}/ServiceRequired_melding.wav",
+    SOUND_PRESET_EMPTY: f"{SOUNDS_PATH}/PresetEmpty_melding.wav",
+}
+
+# Seconds an aplay may run before it counts as hung and is killed.
+#
+# The longest sound is less than 10s; the margin covers a slow start of
+# the audio device. A fixed bound rather than one per file: it only has to tell
+# "still playing" from "never going to finish", and 30s does that for every
+# sound without reading each file first. Raise it if a longer sound is added.
+PLAYBACK_TIMEOUT = 30.0
+
+# Critical error at import time if the sounds directory is missing, so the problem
+# is visible immediately rather than surfacing per-file at play time.
+if not Path(SOUNDS_PATH).is_dir():
+    oradio_log.critical("System sounds directory not found: %s", SOUNDS_PATH)
+    Incidents.publish(IncidentMessage(SOUND_SOURCE, SOUND_MISSING_DIR))
+
+# One incident per outage, not one per sound.
+#
+# Everything the Oradio says goes through here, so a broken audio path would
+# otherwise raise an incident for every button press and every announcement --
+# turning one fault into a stream that buries the rest. The latch clears on the
+# first sound that plays, which is also the recovery signal.
+#
+# Guarded by a lock: watcher threads are one per sound and several can finish at
+# once, and without it two of them can both read False and both report.
+_failure_lock = Lock()
+_failure_reported = False   # pylint: disable=invalid-name  # mutable state, not a constant
+
+
+def _report_playback_failure() -> None:
+    """Publish a playback incident, unless one is already outstanding."""
+    global _failure_reported   # pylint: disable=global-statement
+
+    with _failure_lock:
+        if _failure_reported:
+            return
+        _failure_reported = True
+
+    Incidents.publish(IncidentMessage(SOUND_SOURCE, SOUND_PLAYBACK_FAILED))
+
+
+def _clear_playback_failure() -> None:
+    """Note that sound is working again, so the next failure is reported."""
+    global _failure_reported   # pylint: disable=global-statement
+
+    with _failure_lock:
+        if not _failure_reported:
+            return
+        _failure_reported = False
+
+    oradio_log.info("System sound playback working again")
+
+
+def _kill_hung_playback(process: subprocess.Popen, sound_file: str) -> None:
+    """
+    Kill an aplay that ran past PLAYBACK_TIMEOUT, reap it and report it.
+
+    The reap is bounded too: a process stuck inside a driver call ignores
+    SIGKILL until that call returns, and this thread must not wait on it
+    forever either. If it is still there after that, it is left behind.
+    The failure is reported either way, which is what makes it visible.
+
+    Args:
+        process:    The hung aplay.
+        sound_file: Path played, for the log line.
+    """
+    try:
+        process.kill()
+        _, stderr = process.communicate(timeout=5.0)
+        message = stderr.decode(errors="replace").strip() if stderr else "no output"
+    except subprocess.TimeoutExpired:
+        message = "did not exit after SIGKILL"
+    except Exception as ex_err:      # pylint: disable=broad-exception-caught
+        message = f"could not be killed: {ex_err}"
+
+    oradio_log.error(
+        "Sound playback of '%s' hung for %.0fs and was killed: %s",
+        sound_file, PLAYBACK_TIMEOUT, message,
+    )
+    _report_playback_failure()
+
+
+def _watch_playback(process: subprocess.Popen, sound_file: str) -> None:
+    """
+    Wait for one aplay to finish and report it if it failed.
+
+    Runs on its own thread so play_sound() keeps returning immediately: the
+    Oradio plays prompts from the state machine and from button handlers, and
+    neither can afford to wait out a sound.
+
+    Waits at most PLAYBACK_TIMEOUT. An aplay that has not finished by then is
+    hung -- typically on an audio device that stopped answering -- and is
+    killed and reported like any other failed playback. Without the bound it
+    never exits, so it is never reported, and every later sound (each button
+    click is one) adds another hung aplay and another waiting thread.
+
+    Args:
+        process:    The launched aplay.
+        sound_file: Path played, for the log line.
+    """
+    try:
+        _, stderr = process.communicate(timeout=PLAYBACK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_hung_playback(process, sound_file)
+        return
+    except Exception as ex_err:      # pylint: disable=broad-exception-caught
+        oradio_log.error("Failed to collect sound playback result: %s", ex_err)
+        return
+
+    if process.returncode == 0:
+        _clear_playback_failure()
+        return
+
+    # aplay's own words: "Device or resource busy", "unknown PCM", "wrong
+    # encoding". Without them the incident says only that something failed,
+    # which is the difference between a fault someone can act on and one they
+    # can only observe.
+    message = stderr.decode(errors="replace").strip() if stderr else "no output"
+    oradio_log.error(
+        "Sound playback of '%s' failed (exit %d): %s",
+        sound_file, process.returncode, message,
+    )
+    _report_playback_failure()
+
+
+def play_sound(sound_key: str) -> None:
+    """
+    Launch a fire-and-forget subprocess that plays the given system sound.
+
+    The function returns as soon as the playback process is launched;
+    it does not wait for playback to complete and provides no return value
+    to indicate success or failure. If the sound key is unknown, the error is
+    logged and the function returns. A missing file or a failed launch is
+    logged and also published as an incident; a playback that fails after
+    launch is reported by _watch_playback().
+
+    Args:
+        sound_key (str): One of the SOUND_* constants imported from constants
+                         (e.g. SOUND_START, SOUND_CLICK). Must be a key in
+                         SOUND_FILES; an unknown key is logged as an error.
+    """
+    # Resolve the sound key to a file path
+    sound_file = SOUND_FILES.get(sound_key)
+    if not sound_file:
+        oradio_log.error("Invalid sound key: %s", sound_key)
+        return
+
+    # Verify the file exists before attempting playback.
+    #
+    # An error, not a debug line: every entry in SOUND_FILES ships with the
+    # Oradio, so a missing one is a broken installation rather than a passing
+    # condition -- and the only symptom otherwise is a prompt the user never
+    # hears.
+    if not Path(sound_file).is_file():
+        oradio_log.error("Sound file does not exist or is not a file: %s", sound_file)
+        Incidents.publish(IncidentMessage(SOUND_SOURCE, SOUND_MISSING_FILE))
+        return
+
+    # Launch aplay as a separate process. Passing a list with shell=False avoids
+    # shell-injection risks from special characters in the file path.
+    # start_new_session=True detaches the child from the parent's session and
+    # process group. It does not by itself prevent zombies: the finished child
+    # is reaped by _watch_playback() below, via communicate().
+    #
+    # stderr goes to a pipe rather than to DEVNULL, and _watch_playback() below
+    # reads it. Launching aplay succeeds as long as the binary can be executed;
+    # everything that actually goes wrong -- a busy sink, an unknown device, an
+    # unsupported format -- happens afterwards and is reported on stderr with a
+    # non-zero exit. Discarding it made "play_sound was called and nothing was
+    # heard" a fault with no trace at all.
+    try:
+        process = subprocess.Popen(       # pylint: disable=consider-using-with
+            ["aplay", "-D", SYSTEM_SOUND_SINK, sound_file],
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True
+        )
+    except OSError as ex_err:
+        oradio_log.error("Failed to launch sound playback for '%s': %s", sound_file, ex_err)
+        _report_playback_failure()
+        return
+
+    oradio_log.info("System sound process launched: %s", sound_file)
+
+    # Still fire-and-forget for the caller: the watcher waits, this returns.
+    # Daemon, so a sound in flight never holds up a shutdown.
+    Thread(
+        target=_watch_playback, args=(process, sound_file),
+        daemon=True, name="sound-watch",
+    ).start()
+
+##### Stand-alone entry point #############################
+
+if __name__ == '__main__':
+
+    # Imports only relevant when stand-alone
+    import time
+    import random
+    from utilities import input_prompt
+    from constants import RED, YELLOW, NC           # pylint: disable=ungrouped-imports
+
+    # Most modules use similar code in stand-alone
+    # pylint: disable=duplicate-code
+
+    sound_keys = list(SOUND_FILES.keys())
+
+    def build_menu():
+        """
+        Build and return the interactive test menu as a string.
+        """
+        menu = "\nSelect a function:\n  0-Quit\n"
+        for idx, sound_key in enumerate(sound_keys, start=1):
+            menu += f"{idx:>3}-Play {sound_key}\n"
+        menu += " 99-Stress Test (random sounds)\n"
+        menu += "100-Custom Sequence Test (enter 5 sound numbers)\n"
+        menu += "Select: "
+        return menu
+
+    def interactive_menu():
+        """
+        Run an interactive self-test menu for system sound playback.
+        Blocks until the user enters 0 to quit.
+        """
+        while True:
+            choice = input_prompt(build_menu(), int, -1)
+
+            if choice == 0:
+                break
+
+            if 1 <= choice <= len(sound_keys):
+                key = sound_keys[choice - 1]
+                print(f"\nPlay {key}\n")
+                play_sound(key)
+
+            elif choice == 99:
+                print("\nStress Test\n")
+                try:
+                    duration = int(input("Enter duration in seconds (max 60): "))
+                except ValueError:
+                    print(f"{RED}Invalid input: enter a whole number of seconds.{NC}")
+                    continue
+                duration = max(1, min(duration, 60))
+                start = time.time()
+                def rnd():
+                    while time.time() - start < duration:
+                        play_sound(random.choice(sound_keys))
+                        time.sleep(random.uniform(0.1, 0.5))
+                threads = [Thread(target=rnd, name=f"sound-stress-{idx}") for idx in range(5)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                print("\nStress test completed.\n")
+
+            elif choice == 100:
+                print("\nCustom Sequence Test\n")
+                seq_input = input(f"Enter 5 numbers (1–{len(sound_keys)}) separated by spaces: ")
+                nums = seq_input.strip().split()
+                indices = [int(n) for n in nums if n.isdigit()]
+                if len(indices) != 5 or not all(1 <= i <= len(sound_keys) for i in indices):
+                    print(f"{RED}Invalid input: need exactly 5 integers between 1 and {len(sound_keys)}.{NC}")
+                    continue
+                seq = [sound_keys[i - 1] for i in indices]
+                print(f"Launching sequence: {seq}\n")
+                for k in seq:
+                    play_sound(k)
+
+            else:
+                print(f"{YELLOW}\nInvalid selection. Please enter a valid number.{NC}")
+        # pylint: enable=duplicate-code
+
+    print("\nStarting test program...\n")
+
+    # Launch the interactive test menu; blocks until the user quits
+    interactive_menu()
+
+    print("\nExiting test program...\n")
+
+    # Restore temporarily disabled pylint duplicate code check
+    # pylint: enable=duplicate-code

@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+
+  ####   #####     ##    #####      #     ####
+ #    #  #    #   #  #   #    #     #    #    #
+ #    #  #    #  #    #  #    #     #    #    #
+ #    #  #####   ######  #    #     #    #    #
+ #    #  #   #   #    #  #    #     #    #    #
+  ####   #    #  #    #  #####      #     ####
+
+Created on December 31, 2025
+@author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+@copyright:     Copyright 2025, Oradio Stichting
+@license:       GNU General Public License (GPL)
+@organization:  Oradio Stichting
+@version:       2
+@email:         oradioinfo@stichtingoradio.nl
+@status:        Development
+@summary: Throttling Monitor
+    Monitors the throttled state of a Raspberry Pi and logs state changes.
+    Supports a test mode for forced throttling to validate logging.
+"""
+from time import monotonic
+from threading import Lock
+from subprocess import check_output
+
+##### Oradio modules ######################################
+from singleton import singleton
+from log_service import oradio_log
+from utilities import ThreadTemplate
+from messaging import (
+    Incidents,
+    IncidentMessage,
+    THROTTLING_SOURCE,
+    THROTTLING_START_FAILED,
+    THROTTLING_THROTTLED,
+    POWER_UNDERVOLTAGE,
+    THROTTLING_STOPPED,
+)
+
+##### LOCAL constants #####################################
+
+# Throttle flag definitions: Bit meanings from vcgencmd documentation.
+# The lower nibble (bits 0-3) reflects the current hardware state; the
+# upper nibble (bits 16-19) is a sticky historical record that is set once
+# and never cleared until the next reboot.
+THROTTLE_FLAGS = {
+    # Current state (cleared as soon as condition disappears)
+    0x00001: "Under-voltage detected",        # Supply voltage below ~4.63 V
+    0x00002: "ARM frequency capped",          # Clock reduced due to thermal/power
+    0x00004: "Currently throttled",           # CPU actively running below rated speed
+    0x00008: "Soft temperature limit active", # Core approaching thermal threshold
+
+    # Historical events (sticky since last boot)
+    0x10000: "Under-voltage has occurred",
+    0x20000: "ARM frequency capping has occurred",
+    0x40000: "Throttling has occurred",
+    0x80000: "Soft temperature limit has occurred",
+}
+
+# Bit mask covering only the "current state" flags (bits 0–3).
+# Used to detect real-time transitions without being confused by the sticky
+# historical flags in the upper word.
+ACTIVE_MASK = 0x1 | 0x2 | 0x4 | 0x8
+
+# Bit 0 on its own: the supply is not delivering.
+#
+# Separated from the rest of ACTIVE_MASK because it is a different fault with a
+# different remedy. Bits 1-3 mean the Pi is protecting itself against heat or
+# load and will recover on its own; bit 0 means the power supply cannot keep up,
+# which nothing on the Oradio can fix and which risks corrupting the SD card
+# while it lasts.
+UNDERVOLTAGE_MASK = 0x1
+
+# Sticky counterpart of UNDERVOLTAGE_MASK: bit 16 latches when the voltage has
+# been too low at any point, and stays set until the next reboot.
+#
+# Needed because bit 0 only reports the voltage AT the poll. This monitor looks
+# once a second, so a dip that starts and ends in between leaves bit 0 clear and
+# would otherwise go unseen. Bit 16 catches it -- once: after it latches it can
+# no longer distinguish a second dip from the first.
+UNDERVOLTAGE_STICKY_MASK = 0x10000
+
+# How many under-voltage events within UNDERVOLTAGE_WINDOW mean a supply that
+# cannot keep up.
+#
+# Events within a window rather than polls in a row, because a supply sitting
+# right on the edge does not stay low: it dips, recovers, dips again. Counting
+# consecutive polls would reset on every recovery and never report the worst
+# case there is -- a supply that is under-volting half the time.
+#
+# Starting values, not measured ones: nobody has seen how often bit 0 appears in
+# the field. Every event is logged with the raw word, so these can be retuned on
+# observation rather than on this guess.
+UNDERVOLTAGE_EVENTS = 3
+UNDERVOLTAGE_WINDOW = 60.0  # seconds
+
+# Bit mask covering the upper half-word (bits 16–31), where the sticky
+# "historical event" flags live (bits 16–19 are the documented ones).
+# Used at startup to surface throttling events that occurred before the
+# monitor started, e.g. a brief brownout at boot time.
+HISTORICAL_MASK = 0xFFFF0000
+
+# Seconds vcgencmd may take before the poll counts as failed. It answers in
+# milliseconds; a hung firmware mailbox must not hang the poller with it.
+VCGENCMD_TIMEOUT = 5.0
+
+@singleton
+class RPiThrottlingMonitor(ThreadTemplate):
+    """
+    Singleton background monitor for Raspberry Pi throttling state.
+
+    Polls vcgencmd get_throttled once a second and logs a
+    warning (plus publishes an incident message) whenever active throttling
+    flags become set or change while set, and an info message (no incident)
+    when they all clear, once polling has been started via start(). A
+    one-time-per-run boot-time check is also performed on each start() to
+    surface any historical throttling events that occurred before the
+    monitor was (re)started.
+
+    Built on ThreadTemplate, which provides the restartable
+    setup()/do_work()/teardown() background-thread machinery (safe_start(),
+    safe_stop(), crash detection, etc.), so this class only needs to
+    implement the throttling-specific behaviour.
+    """
+
+    # Restart itself if it crashes; see ThreadTemplate.restart_on_crash.
+    # Polls vcgencmd; nothing it holds needs releasing. The one deliberate stop
+    # (incident_service on POWER_UNDERVOLTAGE, see on_stopped()) is a stop, not
+    # a crash, so it is not undone by this.
+    restart_on_crash = True
+    def __init__(self) -> None:
+        """
+        Initialise the throttling monitor.
+
+        Construction only sets up internal state; the background polling
+        thread is not started until start() is called explicitly, mirroring
+        ThreadTemplate's own separation between construction and
+        safe_start(). This lets callers control exactly when polling
+        begins (and stop()/start() again later) rather than having it
+        begin as a side effect of import.
+        """
+        super().__init__(name="RPiThrottlingMonitor")
+
+        # Cache of the last observed active-flag combination. Reset in
+        # setup() at the start of every run, so a restart always produces
+        # a fresh log entry if the system is already throttled.
+        self._last_active_flags = 0
+        self._undervoltage_events: list[float] = []
+        self._undervoltage_sticky = False
+
+        # Serialises start() and stop(): start()'s is_alive() check and
+        # safe_start() are one step, so two concurrent start() calls cannot
+        # have the loser's safe_start() return False and be reported as
+        # THROTTLING_START_FAILED.
+        self._control_lock = Lock()
+
+        # Set by stop() before safe_stop(), cleared by start(). Tells
+        # on_stopped() that this end was asked for, even when the stop landed
+        # during a crash-restart backoff and the exception from the crash is
+        # still recorded.
+        self._stop_requested = False
+
+##### Helpers #############################################
+
+    @classmethod
+    def _decode_flags(cls, value: int, mask: int) -> list[str]:
+        """
+        Translate a throttle bitmask into a list of human-readable strings.
+
+        Only bits that are both set in value and covered by mask are
+        included, which lets callers filter for current-state or historical
+        flags independently.
+
+        Args:
+            value: Raw bitmask returned by get_throttle_value.
+            mask:  Bit mask specifying which flags are of interest.
+                   Use ACTIVE_MASK for current-state flags or
+                   HISTORICAL_MASK for historical flags.
+
+        Returns:
+            A list of descriptive strings, one per active flag. Returns an
+            empty list if no flags match.
+        """
+        return [
+            name
+            for bit, name in THROTTLE_FLAGS.items()
+            if (value & bit) and (mask & bit)  # Flag is set AND within the requested mask
+        ]
+
+##### ThreadTemplate overrides ############################
+
+    def setup(self) -> None:
+        """
+        One-time-per-run initialisation, called by ThreadTemplate before
+        the polling loop starts.
+
+        Resets the cached active-flag state and reads the full throttle
+        word (including sticky historical bits), warning if any throttling
+        event has occurred since the last reboot. This catches problems
+        that resolved themselves before the monitor started (e.g. a brief
+        brownout at boot time).
+        """
+        self._last_active_flags = 0
+
+        # Reset with the rest: a restart_on_crash restart must not inherit a
+        # half-finished count from the attempt that died.
+        #
+        # The sticky flag is read fresh below, so starting from False here makes
+        # an already-latched bit 16 register as one missed dip on the first
+        # poll. That is the right reading: it did happen, and nothing else in
+        # this run would ever report it.
+        self._undervoltage_events = []
+        self._undervoltage_sticky = False
+
+        value = self.get_throttle_value()
+        if value & HISTORICAL_MASK:
+            reasons = self._decode_flags(value, HISTORICAL_MASK)
+            oradio_log.warning("RPi HEALTH WARNING (since boot): %s", ", ".join(reasons))
+            # The decoded flags as details, so RMS learns WHICH protection kicked
+            # in. Without them the incident says only 'RPi throttled', and the
+            # difference between a hot room and a failing clock is exactly what
+            # someone reading it needs.
+            Incidents.publish(
+                IncidentMessage(THROTTLING_SOURCE, THROTTLING_THROTTLED,
+                                details=", ".join(reasons))
+            )
+
+    def do_work(self) -> None:
+        """
+        Poll the throttling state once and log/publish on any change.
+
+        Called repeatedly by ThreadTemplate's run loop. Only the
+        current-state flags (ACTIVE_MASK) are compared across polls,
+        so sticky historical bits do not trigger repeated log entries.
+
+        Each state transition is logged once:
+        * Enter throttling – logs a warning with the active flag names
+          and publishes an incident message.
+        * Clear throttling – logs an info message indicating the
+          condition resolved.
+        """
+        value = self.get_throttle_value()
+
+        # Mask to current-state bits only; ignore historical sticky flags.
+        active_flags = value & ACTIVE_MASK
+
+        self._check_undervoltage(value)
+
+        # Only act when the active flags have changed since the last poll.
+        if active_flags != self._last_active_flags:
+            if active_flags:
+                # One or more throttling conditions just became active.
+                reasons = self._decode_flags(value, ACTIVE_MASK)
+                oradio_log.warning("RPi throttling ENTERED: %s", ", ".join(reasons))
+                Incidents.publish(
+                    IncidentMessage(THROTTLING_SOURCE, THROTTLING_THROTTLED,
+                                    details=", ".join(reasons))
+                )
+            else:
+                # All throttling conditions have cleared.
+                oradio_log.info("RPi throttling CLEARED")
+
+            # Update the cache so the next iteration has a baseline.
+            self._last_active_flags = active_flags
+
+    def _check_undervoltage(self, value: int) -> None:
+        """
+        Count under-voltage events and report a supply that cannot keep up.
+
+        Args:
+            value: The raw get_throttled word for this poll.
+
+        An event is the voltage being low at this poll (bit 0), or bit 16 having
+        latched since the last one -- a dip that began and ended between two
+        polls and that bit 0 never saw.
+
+        Counted in a window rather than consecutively, because the case that
+        matters most is the one consecutive counting misses: a supply right on
+        the edge dips, recovers and dips again, and a counter that resets on
+        every recovery never reaches its threshold however bad the supply is.
+
+        Reported once per episode. The event list is not cleared afterwards, so
+        it ages out through the window instead -- a supply that stays marginal
+        does not produce a second incident every time it crosses the threshold
+        again.
+
+        Raised separately from THROTTLING_THROTTLED because the two need
+        different answers. Throttling for heat or load passes; a supply below
+        the minimum does not, and the Oradio cannot do anything about it except
+        stop drawing current and say so.
+        """
+        now = monotonic()
+        sticky = bool(value & UNDERVOLTAGE_STICKY_MASK)
+
+        # Bit 16 only ever goes from clear to set, and only once per boot, so
+        # this fires for the first missed dip and never again.
+        missed_dip = sticky and not self._undervoltage_sticky
+        self._undervoltage_sticky = sticky
+
+        if not value & UNDERVOLTAGE_MASK and not missed_dip:
+            return
+
+        self._undervoltage_events = [
+            t for t in self._undervoltage_events if now - t < UNDERVOLTAGE_WINDOW
+        ]
+        self._undervoltage_events.append(now)
+
+        # Logged for every event, at the raw word: this is the evidence the two
+        # constants should eventually be tuned on, and the only record of a
+        # supply that dips without ever reaching the threshold.
+        oradio_log.warning(
+            "Under-voltage event %d of %d within %.0fs (%s, get_throttled=0x%X)",
+            len(self._undervoltage_events), UNDERVOLTAGE_EVENTS, UNDERVOLTAGE_WINDOW,
+            "between polls" if missed_dip else "at this poll", value,
+        )
+
+        if len(self._undervoltage_events) == UNDERVOLTAGE_EVENTS:
+            oradio_log.error(
+                "Supply voltage dropped %d times within %.0fs",
+                UNDERVOLTAGE_EVENTS, UNDERVOLTAGE_WINDOW,
+            )
+            Incidents.publish(IncidentMessage(THROTTLING_SOURCE, POWER_UNDERVOLTAGE))
+
+    def on_stopped(self) -> None:
+        """
+        Report the monitor ending, unless it was told to.
+
+        There is one deliberate stop: the incident service ends this monitor
+        once a supply that cannot keep up has been reported and the Oradio has
+        gone to StateError. Past that point it would only keep polling a failing
+        supply once a second and logging an under-voltage event every time, and
+        reporting its own stop as an incident would be a second report of the
+        one fault that caused it.
+
+        Every other way out is a crash past restart_on_crash's budget, which is
+        what THROTTLING_STOPPED is for. _stop_requested tells the two apart; no
+        exception is checked as well, for a run that ended without either.
+        The flag is needed because a stop() during the crash-restart backoff
+        leaves the exception from that crash in place, and would otherwise be
+        reported as the crash it cut short.
+        """
+        if self._stop_requested or self.exception is None:
+            oradio_log.info("Throttling monitor stopped on request")
+            return
+
+        Incidents.publish(
+            IncidentMessage(THROTTLING_SOURCE, THROTTLING_STOPPED, details=self.stop_reason())
+        )
+
+##### Public API ##########################################
+
+    def get_throttle_value(self) -> int:
+        """
+        Return the current throttle bitmask from the hardware or test stub.
+
+        The value is obtained by running:
+            vcgencmd get_throttled
+        which returns a string of the form throttled=0x50000.
+
+        Note:
+            This method always queries real hardware.
+            The standalone __main__ block below monkeypatches this method
+            on the running instance to drive interactive tests without hardware.
+
+        Returns:
+            Integer bitmask where each set bit indicates a throttling
+            condition as described in THROTTLE_FLAGS.
+
+        Raises:
+            subprocess.TimeoutExpired: vcgencmd did not answer within
+                VCGENCMD_TIMEOUT. Like any other failure here it propagates
+                to ThreadTemplate, which counts it as a crash.
+        """
+        # Call vcgencmd and parse the hex value after the "=" delimiter.
+        out = check_output(
+            ["vcgencmd", "get_throttled"], text=True, timeout=VCGENCMD_TIMEOUT
+        ).strip()
+        return int(out.split("=")[1], 16)
+
+    def start(self) -> None:
+        """
+        Start the background polling thread.
+
+        Thin wrapper around ThreadTemplate.safe_start() that preserves this
+        class's original public API. Idempotent: calling start() when the
+        thread is already alive is a no-op.
+
+        Holds _control_lock throughout, so the is_alive() check and
+        safe_start() are atomic with respect to another start() or stop().
+        """
+        with self._control_lock:
+            if self.is_alive():
+                oradio_log.debug("Throttling monitor already running")
+                return
+
+            # A new run: whatever stop() asked of the previous one is done.
+            self._stop_requested = False
+
+            if not self.safe_start():
+                oradio_log.error("Throttling monitor failed to start")
+                Incidents.publish(IncidentMessage(THROTTLING_SOURCE, THROTTLING_START_FAILED))
+                return
+
+            if self.crashed:
+                oradio_log.error("Throttling monitor crashed during startup: %s", self.exception)
+                Incidents.publish(IncidentMessage(THROTTLING_SOURCE, THROTTLING_START_FAILED))
+                return
+
+            oradio_log.info("Throttling monitor started")
+
+    def stop(self) -> None:
+        """
+        Signal the background polling thread to stop and wait for it to exit.
+
+        Thin wrapper around ThreadTemplate.safe_stop() that preserves this
+        class's original public API.
+
+        Marks the stop as requested before signalling, so on_stopped() does not
+        report it as THROTTLING_STOPPED -- including when it lands during the
+        backoff after a crash, while that crash's exception is still recorded.
+        safe_stop() then still returns False and logs the crash; that is the
+        crash being reported, not this stop.
+        """
+        with self._control_lock:
+            self._stop_requested = True
+            self.safe_stop()
+
+##### Stand-alone entry point #############################
+
+if __name__ == "__main__":
+
+    from time import sleep          # pylint: disable=ungrouped-imports
+    from constants import YELLOW, NC
+    from utilities import input_prompt              # pylint: disable=ungrouped-imports
+    from messaging import DebugMessageHandler       # pylint: disable=ungrouped-imports
+
+    # Most modules use similar code in stand-alone
+    # pylint: disable=duplicate-code
+
+    monitor = RPiThrottlingMonitor()
+
+    # In test mode a single-item dict is used so the poller thread and
+    # this main thread share the same mutable object without needing a lock
+    # becaase dict item assignment is atomic under the GIL.
+    _forced_value = {"bits": 0}
+
+    def _enable_test_mode() -> None:
+        """
+        Monkeypatch the singleton so get_throttle_value() returns
+        _forced_value["bits"] instead of querying vcgencmd.
+
+        This patches the instance only (not the class). The background
+        thread picks up the patched method on its next poll, since attribute
+        lookup checks the instance's __dict__ before the class's.
+        """
+        # Allow overwriting a method by a lambda function
+        monitor.get_throttle_value = lambda: _forced_value["bits"]      # type: ignore[method-assign]
+        oradio_log.info("Throttling monitor TEST MODE enabled")
+
+    def _disable_test_mode() -> None:
+        """Remove the monkeypatch, restoring normal hardware polling."""
+        if "get_throttle_value" in vars(monitor):
+            del monitor.__dict__["get_throttle_value"]
+        oradio_log.info("Throttling monitor TEST MODE disabled")
+
+    def interactive_menu() -> None:
+        """
+        Run an interactive console menu for manually testing the throttle monitor.
+
+        Puts the monitor into test mode (bypassing real hardware) and lets
+        the operator start/stop polling and inject each throttling
+        condition (or combinations thereof) to verify that the correct log
+        messages and error events are produced. Since the monitor no
+        longer self-starts, start/stop are exposed as explicit menu
+        options rather than assumed to already be running.
+
+        Test mode and the monitor's running state are both cleaned up when
+        the user quits.
+        """
+        # Enter test mode so hardware state is bypassed.
+        _enable_test_mode()
+
+        # Allow for print output to propagate
+        sleep(0.5)
+
+        input_selection = (
+            "Select a function, input the number.\n"
+            " 0-Quit\n"
+            " 1-Start throttling monitor\n"
+            " 2-Stop throttling monitor\n"
+            " 3-Force throttled (undervoltage)\n"
+            " 4-Force throttled (frequency capped)\n"
+            " 5-Force throttled (currently throttled)\n"
+            " 6-Force throttled (soft temperature limit)\n"
+            " 7-Force throttled (all)\n"
+            " 8-Clear throttled\n"
+            "Select: "
+        )
+
+        while True:
+            test_choice = input_prompt(input_selection, int, -1)
+            match test_choice:
+                case 0:
+                    _disable_test_mode()
+                    monitor.stop()  # Ensure nothing is left running on exit
+                    break
+                case 1:
+                    print("\nStarting monitor...\n")
+                    monitor.start()
+                case 2:
+                    print("\nStopping monitor...\n")
+                    monitor.stop()
+                case 3:
+                    print("\nForce throttled (TEST MODE)...\n")
+                    _forced_value["bits"] = 0x1  # Under-voltage only
+                case 4:
+                    print("\nForce throttled (TEST MODE)...\n")
+                    _forced_value["bits"] = 0x2  # Frequency cap only
+                case 5:
+                    print("\nForce throttled (TEST MODE)...\n")
+                    _forced_value["bits"] = 0x4  # Throttled only
+                case 6:
+                    print("\nForce throttled (TEST MODE)...\n")
+                    _forced_value["bits"] = 0x8  # Soft temp limit only
+                case 7:
+                    print("\nForce throttled (TEST MODE)...\n")
+                    # Simulate all four active conditions simultaneously.
+                    _forced_value["bits"] = 0x1 | 0x2 | 0x4 | 0x8
+                case 8:
+                    print("\nClear throttled (TEST MODE)...\n")
+                    _forced_value["bits"] = 0  # Simulate recovery
+                case _:
+                    print(f"\n{YELLOW}Please input a valid number{NC}\n")
+
+    print("\nStarting test program...\n")
+
+    # Subscribe to the incident topic and start message handler
+    incident_handler = DebugMessageHandler(Incidents.subscribe())
+
+    # Present menu with tests
+    interactive_menu()
+
+    # Stop receiving messages
+    Incidents.unsubscribe(incident_handler.get_queue())
+    # Signal the thread to exit and confirm it has exited
+    incident_handler.stop()
+
+    print("\nExiting test program...\n")
+
+    # Restore temporarily disabled pylint duplicate code check
+    # pylint: enable=duplicate-code

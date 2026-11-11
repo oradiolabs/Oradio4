@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+#
+#  ####   #####     ##    #####      #     ####
+# #    #  #    #   #  #   #    #     #    #    #
+# #    #  #    #  #    #  #    #     #    #    #
+# #    #  #####   ######  #    #     #    #    #
+# #    #  #   #   #    #  #    #     #    #    #
+#  ####   #    #  #    #  #####      #     ####
+#
+# Created on September 4, 2026
+# @author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+# @copyright:     Stichting Oradio
+# @license:       GNU General Public License (GPL)
+# @organization:  Stichting Oradio
+# @version:       1
+# @email:         info@stichtingoradio.nl
+# @status:        Development
+# @Purpose:       Pre-start gate for oradio.service.
+#
+# oradio_control.py touches i2c, gpio and ALSA during module import, so there is
+# no cushion between exec and first hardware access. This script blocks until
+# that hardware is usable.
+#
+# Runs as the service user - no '+' prefix on the ExecStartPre line - so the
+# access tests check what the Python process will get, not root's.
+#
+# The card wait uses /proc/asound/cards, not dev-snd-controlC0.device,
+# sound.target or alsa-restore.service. Those are all udev-triggered and so
+# inherit whatever udev's queue depth happens to be; /proc/asound/cards is
+# populated by the kernel directly.
+#
+# Every wait ends in exit 0. A missing DAC must let Oradio start and report the
+# fault rather than fail the unit into oradio-crash.service.
+set -u
+
+DEADLINE=60					# 3s at 50ms per tick
+
+# PLACEHOLDER_LOGFILE_BOOT is created by log() itself, with a plain >> redirect
+# and this script running as PLACEHOLDER_USER, so it comes out owned correctly
+# and needs no chown in oradio.service.
+#
+# That holds only because no unit points StandardOutput= at this path. Do NOT
+# turn it into a systemd redirect and do not append to it from anything running
+# as root: systemd does that open as root, so the first boot after the file is
+# deleted would bring it back root:root, and this script could not repair it -
+# it runs without '+' by design and cannot chown.
+#
+# Contrast PLACEHOLDER_LOGFILE_TRACEBACK below, which oradio.service does
+# redirect into. That file already exists, root-owned, before this script
+# starts; the '+' chown in oradio.service is what makes the truncate below
+# succeed.
+log() { printf '%(%F %T)T %s\n' -1 "$*" >>"PLACEHOLDER_LOGFILE_BOOT"; }
+
+# Clear the traceback log for this run. Tolerated rather than assumed: a silent
+# failure would leave stale tracebacks looking current. In practice this only
+# fails if the '+' chown in oradio.service did not run or did not take.
+#
+# Nothing is preserved here. oradio-poststop.sh has already moved the traceback
+# aside if the run that just ended failed.
+: >"PLACEHOLDER_LOGFILE_TRACEBACK" 2>/dev/null || log "prestart: WARNING cannot truncate PLACEHOLDER_LOGFILE_TRACEBACK"
+
+# Mark the start of this run in every log, so the lines of one run can be told
+# from those of the run before. Written here because this script runs at every
+# start of oradio.service: at boot and at every automatic restart after a
+# failure. Before the hardware waits below, so in boot.log their lines come
+# after it.
+#
+# Every *.log in the logging directory that the Oradio and its services write
+# to while running, whichever service that is: they are all owned by
+# PLACEHOLDER_USER, and all their writers append, so a line added here is never
+# overwritten. Rotated logs (*.log.1) are history and are left alone.
+#
+# A log that does not exist yet is not created, except two that this run
+# writes to anyway: the boot log, which the lines below go to, and the
+# application log. So even a fresh logging directory shows where this run
+# starts in both.
+#
+# Not these:
+# - The traceback log: it is emptied above for every run, so it holds this run
+#   only, and oradio-poststop.sh keeps it as evidence only when it is not
+#   empty. A banner in it would make every failure look like one with a
+#   traceback.
+# - The tracebacks oradio-poststop.sh keeps from failed runs (traceback1.log,
+#   traceback2.log): evidence of a run that has ended, which a banner of a
+#   later run must not be appended to.
+# - install.log: the log of tools/install, which marks each of its own runs. A
+#   banner at every start would scatter through the install history, and push
+#   it out at rotation sooner.
+#
+# usb.log does get one, although tools/USB_sync.sh writes to it as well: that
+# script starts the Oradio again at the end of a sync, so there the banner
+# comes just before the sync's last lines, which is when the Oradio started.
+#
+# The clock may still be behind at boot: the Pi has no RTC, and NTP sets it
+# only once the network is up. The banner says so, and gives the time since
+# boot as well, which does not depend on the clock. That matches
+# 'journalctl -o short-monotonic', and the clock-step line oradio.log gets
+# once the clock is synchronized.
+write_start_banner() {
+	local line="################################################################"
+	local now uptime version restarts clock banner logfile
+
+	now=$(printf '%(%F %T %Z)T' -1)
+	read -r uptime _ </proc/uptime
+	version=$(jq -r '.gitinfo // empty' /var/log/oradio_sw_version.log 2>/dev/null)
+	restarts=$(systemctl show --property=NRestarts --value oradio.service 2>/dev/null)
+	if [[ -e /run/systemd/timesync/synchronized ]]; then
+		clock="synchronized"
+	else
+		clock="not synchronized yet, may be behind"
+	fi
+
+	# Time since boot tells a boot (a few seconds) from a later start, and the
+	# restart count tells a restart after a failure (1, 2, ...) from a normal
+	# start (0). The version says which software wrote the lines that follow:
+	# a log outlives updates, so one file can hold lines of several versions.
+	banner=$(printf '%s\n' \
+		"$line" \
+		"# Oradio started    : $now (clock $clock)" \
+		"# Since boot        : ${uptime} s, automatic restarts since boot: ${restarts:-unknown}" \
+		"# Software          : ${version:-unknown}" \
+		"$line")
+
+	local traceback="PLACEHOLDER_LOGFILE_TRACEBACK"
+
+	# Created here if missing, as PLACEHOLDER_USER: this script runs as that user
+	touch "PLACEHOLDER_LOGFILE_BOOT" "PLACEHOLDER_LOGGING_PATH/PLACEHOLDER_LOG_ORADIO" 2>/dev/null
+
+	for logfile in "PLACEHOLDER_LOGGING_PATH"/*.log; do
+		case "$logfile" in
+			# The traceback log itself and the copies poststop keeps of it
+			"${traceback%.log}"*.log | "PLACEHOLDER_LOGFILE_INSTALL")
+				continue ;;
+		esac
+		[[ -f "$logfile" ]] || continue
+		# Braces so 2>/dev/null also covers the error of the >> redirect
+		# itself, which bash reports before applying redirects to its right.
+		# This script's stderr goes to the traceback log.
+		{ printf '%s\n' "$banner" >>"$logfile"; } 2>/dev/null \
+			|| log "prestart: WARNING cannot write start banner to $logfile"
+	done
+}
+
+write_start_banner
+
+wait_for() {
+	local what="$1"; shift
+	local n=0
+	while (( n < DEADLINE )); do
+		if "$@"; then
+			log "prestart: $what ready after $(( n * 50 ))ms"
+			return 0
+		fi
+		(( n++ ))
+		sleep 0.05
+	done
+	log "prestart: WARNING $what NOT ready after $(( DEADLINE * 50 ))ms"
+	return 1
+}
+ 
+# -r and -w rather than -e: devtmpfs creates the node root:root 0600 and it only
+# becomes usable once the group is applied. Testing existence alone would pass
+# while open() still fails with EACCES.
+have_i2c()  { [[ -r /dev/i2c-1 && -w /dev/i2c-1 ]]; }
+have_gpio() { [[ -r /dev/gpiochip0 && -w /dev/gpiochip0 ]]; }
+have_card() { grep -q 'DigiAMP' /proc/asound/cards 2>/dev/null; }
+ 
+wait_for "i2c"  have_i2c
+wait_for "gpio" have_gpio
+wait_for "card" have_card
+
+# Restore the ALSA controls, but only when they are not there already.
+#
+# /etc/asound.conf declares the softvol controls volume_control.py sets at
+# construction, and on a boot they have to be restored before it gets that far.
+# On a service restart they are already there: the card never went away, and the
+# restore has nothing to do.
+#
+# Skipping it then is not just tidiness. alsactl restores every control the card
+# offers, and three on the PCM512x -- Max Overclock PLL, DSP and DAC -- only
+# accept a write while the DAC is idle. mpd keeps the card open across a service
+# restart, so a restore with nothing to do writes three errors anyway:
+#
+#   Cannot write control 'numid=18,...,name='Max Overclock PLL'' : Device or resource busy
+#
+# oradio.service points the whole unit's stderr at the traceback log, which is
+# the file oradio-poststop.sh keeps as evidence after a crash. One that always
+# holds three errors is a poorer signal than one that is usually empty. On the
+# path where the restore does run the card is idle, so there is nothing to
+# complain about.
+#
+# Not by editing /var/lib/alsa/asound.state: that file belongs to alsa-utils,
+# holds the controls the Oradio does need in the same nested format, and a
+# botched edit makes alsactl reject all of it -- no softvol controls, a failing
+# amixer, and no sound at all.
+#
+# sudo rather than a '+' ExecStartPre= of its own: alsactl needs root for
+# asound.state and the card lock, but this script must NOT, or the access tests
+# above would check root's rights instead of the ones the Python process gets.
+# Elevating the single command that needs it keeps both.
+readonly REQUIRED_CONTROLS=("VolumeMPD" "VolumeSysSound")
+
+restore_alsa_controls() {
+	local control
+	for control in "${REQUIRED_CONTROLS[@]}"; do
+		# Read-only and unprivileged: asking whether a control exists needs no
+		# rights, which is why this check sits on the pi side of the fence.
+		if ! amixer -c 0 cget name="$control" >/dev/null 2>&1; then
+			log "prestart: '$control' missing, restoring ALSA controls"
+			# Errors go to stderr and so to the traceback log, where a restore
+			# that actually failed belongs. A missing DAC must not fail the unit,
+			# hence the tolerated status.
+			sudo /usr/sbin/alsactl --no-ucm restore \
+				|| log "prestart: WARNING alsactl restore failed"
+			return
+		fi
+	done
+	log "prestart: ALSA controls already present, skipping restore"
+}
+
+restore_alsa_controls
+ 
+# Read uptime with a redirect rather than $(cut ...): no fork on the critical path.
+read -r uptime_s _ < /proc/uptime
+log "prestart: done at ${uptime_s}s uptime"
+exit 0

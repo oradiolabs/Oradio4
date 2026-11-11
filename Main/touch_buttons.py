@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+  ####   #####     ##    #####      #     ####
+ #    #  #    #   #  #   #    #     #    #    #
+ #    #  #    #  #    #  #    #     #    #    #
+ #    #  #####   ######  #    #     #    #    #
+ #    #  #   #   #    #  #    #     #    #    #
+  ####   #    #  #    #  #####      #     ####
+
+Created on April 28, 2025
+@author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+@copyright:     Copyright 2024, Oradio Stichting
+@license:       GNU General Public License (GPL)
+@organization:  Oradio Stichting
+@version:       4
+@email:         oradioinfo@stichtingoradio.nl
+@status:        Development
+@summary:       Oradio touch buttons module with debounce and one shared edge callback for all buttons.
+    The module test is module_test/touch_buttons_test.py.
+"""
+from threading import Lock, Timer, current_thread
+from time import monotonic
+
+##### Oradio modules ######################################
+from log_service import oradio_log
+from gpio_service import GPIOService
+from system_sounds import play_sound
+from singleton import singleton
+from messaging import (
+    Commands,
+    CommandMessage,
+    BUTTON_SOURCE,
+)
+
+##### GLOBAL constants ####################################
+from constants import (
+    BUTTON_PLAY,
+    BUTTON_RELEASED,
+    BUTTON_SHORT_PRESS,
+    BUTTON_LONG_PRESS,
+    SOUND_CLICK,
+)
+
+##### LOCAL constants #####################################
+BUTTON_DEBOUNCE_TIME     = 500                              # ms — ignore rapid repeats within this window
+DEBOUNCE_SECONDS         = BUTTON_DEBOUNCE_TIME / 1000.0    # converted to seconds for monotonic() comparisons
+LONG_PRESS_DURATION      = 6                                # seconds a button must be held to trigger a long-press event
+BUTTON_LONG_PRESSED      = "button long pressed"
+VALID_LONG_PRESS_BUTTONS = [BUTTON_PLAY]
+
+@singleton
+class TouchButtons:
+    """
+    Handle GPIO-based touch buttons with software debouncing.
+
+    Evaluates button timing to distinguish short-press events from
+    long-press events, publishing the appropriate CommandMessage for each.
+
+    timing/statistics state lives entirely in module-test code
+    (see module_test_metrics.TimingData and touch_buttons_test.py).
+    _button_event_callback() returns whether a press was accepted or
+    discarded by the debounce window precisely so a test harness can keep
+    its own stats without this class needing to track anything for them.
+    It also forwards any "data" payload a caller attaches to a button event
+    (e.g. a timestamp a module test uses for latency measurement) through
+    to the published CommandMessage; outside of tests no caller attaches
+    one, so it is simply None in normal operation.
+    """
+    def __init__(self) -> None:
+        """
+        Set up class variables and register GPIO button callbacks.
+        """
+        self.button_gpio = GPIOService()
+        self.button_press_times: dict[str, float] = {}   # tracks the monotonic time of each button press
+        self.last_trigger_times: dict[str, float] = {}   # tracks the last accepted press time per button
+        self.long_press_timers: dict[str, Timer] = {}    # maps button name → active long-press Timer
+        # Guards long_press_timers, which the GPIO callback thread and the
+        # Timer threads both touch. With the identity check in
+        # _long_press_timeout() it keeps a timer that already fired from
+        # acting on (and disarming) the timer of a later press.
+        self._timers_lock = Lock()
+
+        # Register the callback before enabling interrupts to guarantee no
+        # edge event is missed between registration and the enable call.
+        self.button_gpio.set_button_edge_event_callback(self._button_event_callback)
+        self.button_gpio.enable_button_events()
+
+    def _send_message(self, button_data: dict) -> None:
+        """
+        Publish a CommandMessage for the given button event.
+
+        Builds the appropriate message string from the button name and state,
+        then publishes it to the COMMAND topic via Commands.publish().
+
+        Args:
+            button_data (dict): Must contain:
+                'name'  (str): One of BUTTON_PLAY, BUTTON_STOP,
+                               BUTTON_PRESET1, BUTTON_PRESET2, BUTTON_PRESET3.
+                'state' (str): BUTTON_PRESSED or BUTTON_LONG_PRESSED.
+                'data'  (Any, optional): Extra payload, e.g. a timestamp
+                               attached by a module test for latency
+                               measurement. Forwarded through as-is;
+                               absent in normal operation.
+        """
+        if button_data["state"] == BUTTON_LONG_PRESSED:
+            msg_text = BUTTON_LONG_PRESS + button_data["name"]
+        else:
+            msg_text = BUTTON_SHORT_PRESS + button_data["name"]
+
+        data = button_data.get("data")
+
+        command = CommandMessage(
+            source=BUTTON_SOURCE,
+            message=msg_text,
+            data=[data] if data is not None else None,
+        )
+        oradio_log.info("Send TouchButton message: %s", command)
+        Commands.publish(command)
+
+    def _button_event_callback(self, button_data: dict) -> bool | None:
+        """
+        Handle a raw GPIO button edge event.
+
+        Applies software debouncing, arms or cancels the long-press timer,
+        plays the click sound, and publishes a short-press CommandMessage on
+        each accepted press.
+
+        Args:
+            button_data (dict): Must contain:
+                'name'  (str): One of BUTTON_PLAY, BUTTON_STOP,
+                               BUTTON_PRESET1, BUTTON_PRESET2, BUTTON_PRESET3.
+                'state' (str): BUTTON_RELEASED or the GPIO pressed state.
+                'data'  (Any, optional): Extra timing payload; see _send_message.
+
+        Returns:
+            bool | None: True if a short-press was accepted and a
+                CommandMessage was published; False if it was discarded by
+                the debounce window; None for a release event (neither
+                applies). Callers other than tests can ignore this --
+                it exists so a module test can track accept/neglect
+                counts of its own without this class holding any stats.
+        """
+        button_name = button_data["name"]
+        oradio_log.debug("Button change event: %s = %s", button_name, button_data["state"])
+
+        if button_data["state"] == BUTTON_RELEASED:
+            # Cancel the pending long-press timer so a release before
+            # LONG_PRESS_DURATION does not fire a long-press event.
+            with self._timers_lock:
+                timer = self.long_press_timers.pop(button_name, None)
+            if timer:
+                timer.cancel()
+            return None
+
+        # Button press detected — apply software debounce.
+        now = monotonic()
+        last = self.last_trigger_times.get(button_name, 0.0)
+        time_diff = now - last
+        if time_diff < DEBOUNCE_SECONDS:
+            # Press arrived too soon after the last accepted press;
+            # discard it to avoid spurious repeat events.
+            oradio_log.debug(
+                "New %s event in %s sec, events within the debouncing window of %s will be neglected",
+                button_name, round(time_diff, 3), DEBOUNCE_SECONDS
+            )
+            return False
+
+        self.last_trigger_times[button_name] = now
+        self.button_press_times[button_name] = now
+
+        # Cancel any existing timer, then arm a fresh one for long-press detection.
+        timer = Timer(LONG_PRESS_DURATION, self._long_press_timeout, args=(button_name,))
+        timer.name = f"long-press-{button_name}"
+        timer.daemon = True
+        with self._timers_lock:
+            prev = self.long_press_timers.pop(button_name, None)
+            self.long_press_timers[button_name] = timer
+        if prev:
+            prev.cancel()
+        timer.start()
+
+        play_sound(SOUND_CLICK)
+        self._send_message(button_data)
+        return True
+
+    def _long_press_timeout(self, button_name: str) -> None:
+        """
+        Fire a long-press event if the button is still held after LONG_PRESS_DURATION.
+
+        Only buttons listed in VALID_LONG_PRESS_BUTTONS produce a long-press
+        CommandMessage; all others are silently ignored.
+
+        Acts only if this timer is still the button's armed timer: cancel()
+        cannot stop a Timer that has already fired, so a timer whose press
+        was released (and maybe followed by a new press with its own timer)
+        must neither send a long press nor disarm the newer timer.
+
+        Args:
+            button_name (str): One of BUTTON_PLAY, BUTTON_STOP,
+                               BUTTON_PRESET1, BUTTON_PRESET2, BUTTON_PRESET3.
+        """
+        with self._timers_lock:
+            if self.long_press_timers.get(button_name) is not current_thread():
+                return  # Superseded by a release or a newer press; ignore.
+
+            if not self.button_gpio.get_button_state(button_name):
+                return  # Button was released before the timeout fired; ignore.
+
+            # Disarm the timer entry since we are executing the timeout now.
+            self.long_press_timers.pop(button_name, None)
+
+        if button_name in VALID_LONG_PRESS_BUTTONS:
+            self._send_message({
+                "name":  button_name,
+                "state": BUTTON_LONG_PRESSED,
+            })
+
+##### Stand-alone entry point #############################
+
+if __name__ == '__main__':
+    print("The module test for touch_buttons.py is at module_test/touch_buttons_test.py")

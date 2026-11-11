@@ -1,0 +1,55 @@
+[MAIN]
+# Files or directories to ignore (commonly virtual environments)
+ignore=venv
+
+[MESSAGES CONTROL]
+# Disable specific messages that are not strict PEP8 violations or often overly verbose
+# C0301: line too long; defaults to 100
+# C0302: max module lines; defaults to 1000
+#        too-many-statements and too-many-branches measure actual complexity
+# R0903: too-few-public-methods (e.g. for simple data classes)
+# C0411: wrong import order - To be fixed by converting Oradio4 into a package
+disable=C0301, C0302, R0903, C0411
+
+[FORMAT]
+# Indentation settings (4 spaces, as per PEP8)
+indent-string='    '
+indent-after-paren=4
+
+[DESIGN]
+# Complexity limits — these can be adjusted for your project size
+max-args=5
+max-locals=15
+max-returns=6
+max-branches=12
+max-statements=50
+max-attributes=10
+max-nested-blocks=5
+
+[BASIC]
+# Allow commonly used short variable names (like loop counters)
+good-names=i,j,k,ex,Run,_
+# Regular expressions for naming conventions (PEP8: snake_case and PascalCase)
+variable-naming-style=snake_case
+argument-naming-style=snake_case
+attr-naming-style=snake_case
+function-naming-style=snake_case
+class-naming-style=PascalCase
+const-naming-style=UPPER_CASE
+
+[TYPECHECK]
+# Ignore RPi-only modules
+ignored-modules=
+    RPi,
+    RPi.GPIO,
+    dbus,
+    dbus.mainloop,
+    dbus.mainloop.glib,
+    dbus.exceptions,
+    gi,
+    gi.repository
+
+[REPORTS]
+# Cleaner output: no full reports, just messages and scores
+reports=no
+score=yes
