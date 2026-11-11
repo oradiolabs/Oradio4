@@ -1,33 +1,39 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Something in Oradio4 (main or an experiment branch) does not work as it should
 title: ''
-labels: bug
+type: Bug
 assignees: ''
 
 ---
 
-**Version detected**
-Describe in which version of Oradio software the bug was detected
+**Version**
+Branch and commit installed on the Oradio. On the Oradio, run:
+`jq -r .gitinfo /var/log/oradio_sw_version.log`
+e.g. `Branch 'main' @ 084f719`
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**What happened**
+A clear and concise description of what went wrong.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Steps to reproduce**
+What you did, in order: buttons, volume knob, web interface, USB stick, power on/off, ...
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+1.
+2.
+3.
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
-
-**Additional context**
-Add any other context about the problem here.
+**Expected behaviour**
+What you expected to happen instead.
 
 **Reproducible?**
-Mark if the scenario can be reproduced or not
+- [ ] Every time
+- [ ] Sometimes
+- [ ] Happened once
+
+**Logs**
+Attach the relevant files from `~/Oradio4/logging/` (e.g. `oradio.log`, `traceback.log`, `install.log`).
+
+**Additional context**
+Hardware, network, screenshots of the web interface, anything else that helps.
+
+> Found the bug on an Oradio3 in use? Report it in [Oradio3](https://github.com/oradiolabs/Oradio3/issues/new/choose) instead.

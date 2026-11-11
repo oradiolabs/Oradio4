@@ -1,20 +1,24 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Suggest a feature or change for Oradio4
 title: ''
-labels: enhancement
+type: Feature
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**Problem or wish**
+What does a listener, maintainer or the Stichting run into today, or want to be able to do?
+Ex. I'm always frustrated when [...]
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**Proposed solution**
+What you would like to happen.
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**Alternatives considered**
+Other solutions or features you thought of, and why they fall short.
+
+**Research needed?**
+What do we need to find out before this can be built? Each open question can become an experiment.
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Links, sketches, screenshots, related issues.

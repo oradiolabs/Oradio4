@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Bug in an Oradio3 in use
+    url: https://github.com/oradiolabs/Oradio3/issues/new/choose
+    about: Oradio3 is the software of the Oradio in use today. Report its bugs there.
