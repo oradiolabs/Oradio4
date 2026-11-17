@@ -9,6 +9,24 @@
 Description=Oradio
 After=basic.target
 
+# After the boot-time 'alsactl restore', which brings back the softvol controls
+# (VolumeMPD, VolumeSysSound) volume_control.py needs. Without it
+# oradio-prestart.sh gets to its ALSA check first, finds the controls missing and
+# runs a second, slower 'alsactl restore' through sudo itself.
+#
+# Wants= as well as After=: alsa-restore.service is otherwise started by udev,
+# through sound.target, once udev gets round to the sound card -- at ~6.1 s,
+# when oradio.service has already started at ~5.5 s. After= alone orders only
+# against a job that is already queued, so it did nothing. Wanted from here, it
+# is queued at boot and runs as soon as basic.target is reached, like
+# oradio.service itself, taking ~0.1 s. The sound modules are loaded by
+# systemd-modules-load well before that, so /dev/snd/control* exists. If it does
+# not, alsa-restore.service skips on its own condition and the prestart check
+# restores the controls as before. Wants=, not Requires=: a missing or failed
+# alsa-restore.service does not hold Oradio back.
+Wants=alsa-restore.service
+After=alsa-restore.service
+
 # Crash handling, in two tiers.
 #
 # Tier one is systemd's own: Restart=on-failure below brings the service back
@@ -90,6 +108,12 @@ ExecStartPre=/usr/local/sbin/oradio-prestart.sh
 # Execute service in user environment.
 User=PLACEHOLDER_USER
 Group=PLACEHOLDER_GROUP
+
+# /run/oradio, owned by PLACEHOLDER_USER, for oradio-prestart.sh's count of
+# starts since boot. Preserved when the service stops, so the count survives
+# restarts; /run is a tmpfs, so it starts again at every boot.
+RuntimeDirectory=oradio
+RuntimeDirectoryPreserve=yes
 
 # Keeps the traceback of a run that failed, as traceback1.log, and the failure
 # before it as traceback2.log.
