@@ -1,0 +1,71 @@
+# Builds the minimal MPD .deb for Oradio (see tools/build-mpd-minimal.sh)
+#
+# Runs on GitHub's arm64 Linux runner inside a debian:trixie container, so the
+# package is built against exactly the libraries the Oradio runs with.
+#
+# - On a push that changes the build script or this workflow: build only, and
+#   keep the .deb as a workflow artifact (check the build-info.txt in it).
+# - Run by hand (Actions > Build minimal MPD > Run workflow) with "release"
+#   ticked: build, and publish the .deb as a GitHub release. oradio_install.sh
+#   downloads it from there; update MPD_DEB_* in constants.env to match.
+
+name: Build minimal MPD
+
+on:
+  workflow_dispatch:
+    inputs:
+      mpd_version:
+        description: "Debian source version to rebuild (empty: current trixie)"
+        required: false
+        default: ""
+      local_suffix:
+        description: "Local version suffix; bump the number for a rebuild of the same Debian version"
+        required: false
+        default: "+oradio1"
+      release:
+        description: "Publish as a GitHub release"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - tools/build-mpd-minimal.sh
+      - .github/workflows/build-mpd-minimal.yml
+
+permissions:
+  contents: write    # only used by the release step
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build
+        id: build
+        env:
+          MPD_VERSION: ${{ inputs.mpd_version }}
+          LOCAL_SUFFIX: ${{ inputs.local_suffix || '+oradio1' }}
+          OUT_DIR: dist
+        run: bash tools/build-mpd-minimal.sh
+
+      - name: Keep as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.tag }}
+          name: "Minimal MPD ${{ steps.build.outputs.version }}"
+          body_path: dist/build-info.txt
+          files: |
+            dist/${{ steps.build.outputs.deb }}
+            dist/SHA256SUMS
+            dist/build-info.txt
