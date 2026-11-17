@@ -23,7 +23,7 @@ Created on Januari 31, 2025
 """
 import threading
 from os.path import ismount
-from time import sleep
+from time import sleep, monotonic
 
 from log_service import oradio_log
 from backlight_service import Backlighting
@@ -165,6 +165,14 @@ WEBSERVICE_BLINK_CYCLE = 2.0
 # overtaken. Short enough that a stale retry thread goes away quickly; the
 # library becoming ready still wakes the current one at once.
 PRESET_RETRY_POLL = 1.0
+
+# Seconds after power-on during which a web radio pressed without internet waits
+# for WiFi instead of announcing "no internet". At boot WiFi is still coming up:
+# NetworkManager typically reports internet ~3 s after the start-up tune, so a
+# press right after the tune found none. 30 s leaves room for a slow access point
+# or DHCP server. time.monotonic() counts from boot on Linux, so this applies to
+# a boot and not to a later restart of oradio.service.
+WIFI_BOOT_GRACE = 30.0
 
 def run_later(delay: float, function, *args) -> None:
     """
@@ -435,6 +443,11 @@ usb_known = threading.Event()
 # usb_known, which it belongs with. See StateMachine.release_startup().
 startup_idle_held = threading.Event()
 
+# Set while WifiService reports WIFI_CONNECTED, that is NetworkManager reports
+# full internet access. A web radio pressed during WIFI_BOOT_GRACE without
+# internet waits on this. See StateMachine._play_preset().
+wifi_connected = threading.Event()
+
 # ----------------------State Machine------------------
 
 class StateMachine:
@@ -608,6 +621,10 @@ class StateMachine:
             # radio has no next song, but neither should announce the button
             # number again -- the user already heard it when they first pressed.
             if self._webradio_without_internet(preset):
+                if _wifi_may_still_come_up():
+                    # The first press is waiting for WiFi with its LED blinking
+                    oradio_log.info("Web radio preset pressed again, still waiting for WiFi")
+                    return True
                 oradio_log.info("Web radio preset pressed again, still no internet")
                 play_sound(SOUND_NO_INTERNET)
             else:
@@ -1141,7 +1158,19 @@ class StateMachine:
         # "not ever": starting a stream with no route out leaves MPD retrying a
         # URL it cannot reach, and it would begin playing by itself the moment
         # the portal closes and WiFi comes back -- music nobody asked for.
+        #
+        # At boot, before WiFi is up, the answer is "not yet" rather than "not
+        # now": wait for WiFi with the LED blinking, as for the library above,
+        # and play when it comes. Only if it has not come by WIFI_BOOT_GRACE does
+        # the replay below announce "no internet". Once only, like the library.
         if self._webradio_without_internet(preset):
+            if retry_if_not_ready and _wifi_may_still_come_up():
+                oradio_log.info("Web radio preset '%s' pressed before WiFi was up: waiting", preset)
+                self._start_library_retry(
+                    preset, lambda: self._play_preset(preset, retry_if_not_ready=False),
+                    wait=_wait_for_wifi,
+                )
+                return
             oradio_log.info("Preset '%s' is a webradio and there is no internet", preset)
             self._take_web_preset_change(preset)
             mpd_control.stop()
@@ -1188,7 +1217,7 @@ class StateMachine:
             preset, lambda: self._play_preset(preset, retry_if_not_ready=False),
         )
 
-    def _start_library_retry(self, label: str, replay) -> None:
+    def _start_library_retry(self, label: str, replay, wait=None) -> None:
         """
         Start a thread that runs `replay` once the library is ready.
 
@@ -1196,17 +1225,21 @@ class StateMachine:
             label:  What was pressed, for the log and the thread name.
             replay: Called under task_lock once the library is ready, unless
                     the press was overtaken first.
+            wait:   What to wait for instead of the library: a callable taking
+                    a timeout in seconds and returning True when ready, like
+                    mpd_control.wait_for_library. _wait_for_wifi for a web radio
+                    pressed at boot before WiFi was up.
 
         Must be called from a state handler: the retry is tagged with that
         handler's generation.
         """
         threading.Thread(
             target=self._retry_when_library_ready,
-            args=(label, replay, self._handler_generation),
+            args=(label, replay, self._handler_generation, wait or mpd_control.wait_for_library),
             daemon=True, name=f"library-retry-{label}",
         ).start()
 
-    def _retry_when_library_ready(self, label: str, replay, generation: int) -> None:
+    def _retry_when_library_ready(self, label: str, replay, generation: int, wait) -> None:
         """
         Carry out a press (a preset or Play) that came before the library was ready.
 
@@ -1214,6 +1247,7 @@ class StateMachine:
             label:      What was pressed, for the log.
             replay:     What to run once the library is ready.
             generation: The generation of the handler that started this retry.
+            wait:       Waits for the library (or for WiFi), see _start_library_retry().
 
         Runs on its own thread so the command handler is free while it waits.
         The LED keeps blinking throughout, which is the whole point: the user
@@ -1232,7 +1266,7 @@ class StateMachine:
         lock for that long would freeze every button. It also keeps it from
         running at the same time as a handler's turn_off_all_leds().
         """
-        while not mpd_control.wait_for_library(PRESET_RETRY_POLL):
+        while not wait(PRESET_RETRY_POLL):
             if not self.is_current(generation):
                 oradio_log.info("Dropping retry of '%s': overtaken while waiting", label)
                 return
@@ -1243,7 +1277,7 @@ class StateMachine:
                     oradio_log.info("Dropping retry of '%s': state is now %s", label, self.state)
                     return
                 self._handler_generation = generation
-            oradio_log.info("Library ready: carrying out '%s'", label)
+            oradio_log.info("Ready: carrying out '%s'", label)
             replay()
 
     def _state_preset1(self):
@@ -1431,6 +1465,25 @@ def on_usb_present():
 
 # Messages when after the closure of the Oradio AP Webservice the Wifi connection is/not made
 
+def _wifi_may_still_come_up() -> bool:
+    """
+    Whether WiFi may still be coming up after power-on.
+
+    True during WIFI_BOOT_GRACE, until WifiService reports WIFI_CONNECTED. A web
+    radio pressed then waits for WiFi instead of announcing "no internet".
+    """
+    return not wifi_connected.is_set() and monotonic() < WIFI_BOOT_GRACE
+
+def _wait_for_wifi(timeout: float) -> bool:
+    """
+    Wait at most `timeout` seconds for WiFi, for a web radio pressed at boot.
+
+    Returns:
+        True once WIFI_CONNECTED has come, or once WIFI_BOOT_GRACE is over and
+        waiting longer is no use: the replay then announces "no internet".
+    """
+    return wifi_connected.wait(timeout) or not _wifi_may_still_come_up()
+
 def on_wifi_connected():
     """
     Note that WiFi is up, and say so if the user is waiting to hear it.
@@ -1450,6 +1503,7 @@ def on_wifi_connected():
     arrived, and four seconds later another attempt could have replaced it.
     """
     oradio_log.info("Wifi is connected acknowledged")
+    wifi_connected.set()
 
     if not oradio_wifi_service.take_user_connect():
         oradio_log.debug("WiFi connected on its own: nothing to announce")
@@ -1493,6 +1547,7 @@ def on_wifi_fail_connect():
     arrived, and four seconds later another attempt could have replaced it.
     """
     oradio_log.info("Wifi fail connect acknowledged")
+    wifi_connected.clear()
 
     if not oradio_wifi_service.take_user_connect():
         oradio_log.debug("WiFi failure without a user request: nothing to announce")
@@ -1524,6 +1579,7 @@ def on_wifi_access_point():
     announce a network that is not serving anything yet.
     """
     oradio_log.info("Configured as access point acknowledged")
+    wifi_connected.clear()
 
 def on_wifi_not_connected():
     """
@@ -1538,6 +1594,7 @@ def on_wifi_not_connected():
     WiFi change.
     """
     oradio_log.info("Wifi is NOT connected acknowledged")
+    wifi_connected.clear()
 
 # -------------------WEB---------------------------
 

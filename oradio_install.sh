@@ -840,7 +840,7 @@ install_resource "$RESOURCES_PATH/asound.conf" /etc/asound.conf \
 #
 # Debian's mpd loads 328 shared libraries before it reads its config: ~4 s on a
 # cold Pi 3A+, competing with oradio.service for the SD card. The minimal build
-# loads 46. It is Debian's package rebuilt with fewer features, so units, user,
+# loads 47. It is Debian's package rebuilt with fewer features, so units, user,
 # paths and conffiles stay the same. See tools/build-mpd-minimal.sh.
 #
 # Installed from install_resources/<MPD_DEB_TAG>_<arch>.deb when its version
