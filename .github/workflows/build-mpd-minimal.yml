@@ -1,38 +1,25 @@
-# Builds the minimal MPD .deb for Oradio (see tools/build-mpd-minimal.sh)
+# Builds the minimal MPD package for Oradio: see tools/build-mpd-minimal.sh.
 #
-# Runs on GitHub's arm64 Linux runner inside a debian:trixie container, so the
-# package is built against exactly the libraries the Oradio runs with.
-#
-# - On a push that changes the build script or this workflow: build only, and
-#   keep the .deb as a workflow artifact (check the build-info.txt in it).
-# - Run by hand (Actions > Build minimal MPD > Run workflow) with "release"
-#   ticked: build, and publish the .deb as a GitHub release. oradio_install.sh
-#   downloads it from there; update MPD_DEB_* in constants.env to match.
+# Runs on a push that changes the build script or this workflow, on GitHub's
+# arm64 runner in a debian:trixie container, and keeps the result as an
+# artifact. To use a build:
+#   1. Download the artifact and check build-info.txt in it.
+#   2. Replace the .deb in install_resources/ with the one from the artifact.
+#      install_resources/ holds exactly one MPD .deb.
+#   3. Set MPD_DEB_TAG in constants.env to the tag in build-info.txt.
+# Every build has a newer version (it carries the build date), so devices with
+# an older build get the new one on the next oradio_install.sh run.
 
 name: Build minimal MPD
 
 on:
-  workflow_dispatch:
-    inputs:
-      mpd_version:
-        description: "Debian source version to rebuild (empty: current trixie)"
-        required: false
-        default: ""
-      local_suffix:
-        description: "Local version suffix; bump the number for a rebuild of the same Debian version"
-        required: false
-        default: "+oradio1"
-      release:
-        description: "Publish as a GitHub release"
-        type: boolean
-        default: false
   push:
     paths:
       - tools/build-mpd-minimal.sh
       - .github/workflows/build-mpd-minimal.yml
 
 permissions:
-  contents: write    # only used by the release step
+  contents: read
 
 jobs:
   build:
@@ -46,8 +33,8 @@ jobs:
       - name: Build
         id: build
         env:
-          MPD_VERSION: ${{ inputs.mpd_version }}
-          LOCAL_SUFFIX: ${{ inputs.local_suffix || '+oradio1' }}
+          # Debian source version, e.g. 0.24.4-1. Empty: current in trixie
+          MPD_VERSION: ""
           OUT_DIR: dist
         run: bash tools/build-mpd-minimal.sh
 
@@ -57,15 +44,3 @@ jobs:
           name: ${{ steps.build.outputs.tag }}
           path: dist/
           if-no-files-found: error
-
-      - name: Publish release
-        if: ${{ inputs.release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.build.outputs.tag }}
-          name: "Minimal MPD ${{ steps.build.outputs.version }}"
-          body_path: dist/build-info.txt
-          files: |
-            dist/${{ steps.build.outputs.deb }}
-            dist/SHA256SUMS
-            dist/build-info.txt

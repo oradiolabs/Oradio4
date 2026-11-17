@@ -18,57 +18,59 @@
 # @Purpose:       Build a minimal MPD .deb for Oradio
 #
 # WHY
-# Debian's mpd links 328 shared libraries: Samba (77), the whole ffmpeg stack,
-# ICU, PulseAudio, PipeWire, JACK, tracker and game-music decoders, and more.
-# Loading them costs ~4.1 s on a cold Pi 3A+ and ~2.0 s of CPU even when warm,
-# before MPD reads its first line of config. During boot that load competes
-# with oradio.service for the SD card, and MPD was ready only at ~16 s.
+# Debian's mpd links 328 shared libraries: Samba, the whole ffmpeg stack,
+# PulseAudio, PipeWire, JACK, tracker and game-music decoders, and more. Loading
+# them takes ~4.1 s on a cold Pi 3A+ (~2.0 s CPU even when warm), before MPD
+# reads its config, and during boot that competes with oradio.service for the
+# SD card.
 #
-# Oradio plays MP3 only: files from the USB stick and plain HTTP(S) MP3 web
-# radio streams. System sounds are WAV, played by aplay, not by MPD. So this
-# build keeps exactly:
-#   output   alsa
-#   input    file (built in), curl
-#   decoder  mpg123 (and pcm, built in)
-#   tags     id3tag
-#   database simple, gzip-compressed (zlib)
-#   search   Unicode case folding (icu)
-#   playlist m3u, extm3u, pls (built in, no dependencies)
-#   other    systemd notify/socket activation, tcp, unix socket, ipv6
-# Everything else is switched off with -Dauto_features=disabled plus explicit
-# 'false' for the boolean options.
+# Oradio plays only MP3 through MPD: files on the USB stick and HTTP(S) MP3 web
+# radio streams. System sounds are WAV and go through aplay. This build keeps:
+#   output    alsa
+#   input     file, curl
+#   decoder   mpg123, pcm
+#   tags      id3tag
+#   database  simple, gzip-compressed (zlib)
+#   search    Unicode case folding (icu)
+#   playlist  m3u, extm3u, pls
+#   other     systemd notify and socket activation, tcp, unix socket, ipv6
+# 46 libraries in total. Everything else is off.
 #
-# Known differences from Debian's build that matter to Oradio:
-#  - No SQLite: 'sticker_file' in mpd.conf is ignored. Oradio uses no stickers.
-#  - Decoder blocks in mpd.conf for plugins that are not built (hybrid_dsd,
-#    wildmidi) are ignored silently by MPD; mpd.conf needs no change.
+# mpd.conf needs no change: MPD ignores 'sticker_file' without SQLite (Oradio
+# uses no stickers) and blocks for plugins that are not built (hybrid_dsd,
+# wildmidi).
 #
 # HOW
-# Rebuilds Debian's own source package, so the result keeps Debian's systemd
-# units, mpd user, paths, conffiles and maintainer scripts. Only debian/rules
-# is replaced (the feature list) and a local changelog entry is added, giving a
-# version such as 0.24.4-1+oradio1: newer than Debian's same upstream release.
-# oradio_install.sh installs it and puts mpd on hold, so pkg-helper.sh leaves it
-# alone.
+# Rebuilds Debian's own mpd source package with only debian/rules replaced and
+# a changelog entry added. Units, mpd user, paths, conffiles and maintainer
+# scripts stay Debian's. oradio_install.sh installs the result from
+# install_resources/ and holds it, so pkg-helper.sh leaves it alone.
+#
+# VERSION
+# <Debian version>+oradio.<UTC build date>, e.g. 0.24.4-1+oradio.20261117.
+# Newer than Debian's build of the same release and than every earlier build,
+# so devices pick up a rebuild without anything bumped by hand. A '.' before
+# the date: Debian splits a version at its last '-'. No digit straight after
+# "oradio": "oradio1" reads as the product Oradio 1.
+# File name: the version with '+' as '-', e.g.
+# mpd-0.24.4-1-oradio.20261117_arm64.deb. The part before '_arm64.deb' is the
+# tag that goes into MPD_DEB_TAG in constants.env.
 #
 # WHERE
-# Runs as root in a debian:trixie arm64 container: see
-# .github/workflows/build-mpd-minimal.yml. Building on a Pi 3A+ itself is not
-# practical (hours, and 512 MB RAM is not enough for the C++ compile).
+# As root in a debian:trixie arm64 container, see
+# .github/workflows/build-mpd-minimal.yml. Not on a Pi 3A+: hours of compiling,
+# and 512 MB RAM is not enough.
 #
-# Usage: build-mpd-minimal.sh
-#   MPD_VERSION   Debian source version to rebuild, e.g. 0.24.4-1 (default:
-#                 the current one in trixie)
-#   LOCAL_SUFFIX  Appended to the Debian version (default: +oradio1)
-#   OUT_DIR       Where the .deb (named <tag>_arm64.deb), SHA256SUMS and
-#                 build-info.txt go
-#                 (default: ./dist)
-#   --print-meson-options  Print the meson options and exit (for testing)
+# Usage: build-mpd-minimal.sh [--print-meson-options]
+#   MPD_VERSION   Debian source version to rebuild, e.g. 0.24.4-1
+#                 (default: the current one in trixie)
+#   OUT_DIR       Where the .deb and build-info.txt go (default: ./dist)
+#   --print-meson-options  Print the meson options and exit
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# The feature set. Everything not named here is disabled by auto_features.
+# Feature set: auto_features switches off every feature not named here
 # ---------------------------------------------------------------------------
 MESON_OPTIONS=(
 	-Dauto_features=disabled
@@ -81,12 +83,10 @@ MESON_OPTIONS=(
 	-Dcurl=enabled
 	-Dmpg123=enabled
 	-Did3tag=enabled
-	# The simple database (/var/lib/mpd/tag_cache, and install_resources/
-	# mpd.database) is gzip-compressed. Without zlib MPD reports "Database
-	# corrupted", discards it and rescans the whole USB stick.
+	# tag_cache and install_resources/mpd.database are gzip-compressed.
+	# Without zlib MPD calls them corrupted and rescans the whole stick.
 	-Dzlib=enabled
-	# Unicode case folding for 'search': "beyonce" finds "Beyoncé", as with
-	# Debian's build. Measured on a Pi 3A+: 0.07 s cold, 0.01 s warm.
+	# 'search' finds "Beyoncé" for "beyonce". Costs 0.07 s cold on a Pi 3A+.
 	-Dicu=enabled
 	-Dipv6=enabled
 	-Dtcp=true
@@ -94,11 +94,11 @@ MESON_OPTIONS=(
 	-Ddatabase=true
 	-Ddaemon=true
 
-	# Kept so Debian's packaging (dh --with sphinxdoc, doc-base, manpages)
-	# works unchanged. Build-time only: adds nothing MPD loads at runtime.
+	# Needed by Debian's packaging (sphinxdoc, doc-base, man pages).
+	# Nothing of it is loaded at runtime.
 	-Ddocumentation=enabled
 
-	# Boolean options default to true; auto_features does not touch them
+	# Booleans default to true and are not covered by auto_features
 	-Dinotify=false
 	-Ddsd=false
 	-Dneighbor=false
@@ -110,7 +110,7 @@ MESON_OPTIONS=(
 	-Drecorder=false
 	-Dsnapcast=false
 
-	# Combo options: auto_features does not touch these either
+	# Neither are combo options
 	-Dupnp=disabled
 	-Dzeroconf=disabled
 )
@@ -126,14 +126,14 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 MPD_VERSION="${MPD_VERSION:-}"
-LOCAL_SUFFIX="${LOCAL_SUFFIX:-+oradio1}"
+BUILD_DATE="$(date -u +%Y%m%d)"
 OUT_DIR="$(realpath -m "${OUT_DIR:-dist}")"
 export DEBIAN_FRONTEND=noninteractive
 
 # ---------------------------------------------------------------------------
 # Source and build dependencies
 # ---------------------------------------------------------------------------
-# The container ships binary sources only
+# The container image has no deb-src entries
 if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
 	sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
 fi
@@ -145,20 +145,17 @@ cd "$WORK"
 apt-get source -q "mpd${MPD_VERSION:+=$MPD_VERSION}"
 cd mpd-*/
 
-# Debian's full build-dependency list: more than this build needs, but it keeps
-# the script free of a second list to maintain, and it only costs CI time.
+# All of Debian's build dependencies: more than needed, but no second list to
+# maintain, and it only costs CI time.
 apt-get build-dep -y -q ./
 
 DEBIAN_VERSION="$(dpkg-parsechangelog -S Version)"
-NEW_VERSION="${DEBIAN_VERSION}${LOCAL_SUFFIX}"
+NEW_VERSION="${DEBIAN_VERSION}+oradio.${BUILD_DATE}"
 echo "Rebuilding mpd ${DEBIAN_VERSION} as ${NEW_VERSION}"
 
 # ---------------------------------------------------------------------------
-# debian/rules: Debian's, with the configure step replaced
+# debian/rules: Debian's overrides, with our feature set for configure
 # ---------------------------------------------------------------------------
-# Debian's other overrides are kept as they are. If a future Debian revision
-# adds overrides this script does not know about, the build will still
-# succeed but without them: check 'diff' in build-info.txt when bumping.
 cp debian/rules debian/rules.debian
 {
 	echo '#!/usr/bin/make -f'
@@ -185,7 +182,7 @@ cp debian/rules debian/rules.debian
 } >debian/rules
 chmod 0755 debian/rules
 
-# Fail loudly if Debian's rules grew overrides this script would silently drop
+# Stop if a newer Debian revision has overrides this script does not reproduce
 known='override_dh_auto_configure|override_dh_installchangelogs|override_dh_installsystemd|override_dh_installsystemduser'
 unknown="$(grep -oE '^override_[a-z_]+' debian/rules.debian | grep -vxE "$known" || true)"
 if [[ -n "$unknown" ]]; then
@@ -199,7 +196,8 @@ fi
 # ---------------------------------------------------------------------------
 {
 	printf 'mpd (%s) trixie; urgency=medium\n\n' "$NEW_VERSION"
-	printf '  * Minimal build for Oradio: alsa, curl, mpg123, id3tag, systemd.\n'
+	printf '  * Minimal build for Oradio: alsa, curl, mpg123, id3tag, zlib, icu,\n'
+	printf '    systemd.\n'
 	printf '    Built by tools/build-mpd-minimal.sh in oradiolabs/Oradio4.\n\n'
 	printf ' -- Stichting Oradio <info@stichtingoradio.nl>  %s\n\n' "$(date -R)"
 	cat debian/changelog
@@ -218,29 +216,25 @@ mkdir -p "$OUT_DIR"
 DEB_ARCH="$(dpkg-architecture -qDEB_HOST_ARCH)"
 DEB_BUILT="../mpd_${NEW_VERSION#*:}_${DEB_ARCH}.deb"
 
-# Release tag and asset name without '+', ':' or '~': those are awkward in tags,
-# URLs and constants.env (whose values may not contain '+'). dpkg reads the
-# version from inside the package, not from the file name.
+# See VERSION above. constants.env values may not contain '+'.
 TAG="mpd-${NEW_VERSION//[+:~]/-}"
 DEB_NAME="${TAG}_${DEB_ARCH}.deb"
 cp "$DEB_BUILT" "$OUT_DIR/${DEB_NAME}"
 
-# Install it here, which also checks its dependencies resolve on trixie
+# Installing it here also checks that its dependencies resolve on trixie
 apt-get install -y -q "$OUT_DIR/${DEB_NAME}"
 
 needed="$(readelf -d /usr/bin/mpd | grep -c NEEDED)"
 total="$(ldd /usr/bin/mpd | grep -c '=>')"
-(cd "$OUT_DIR" && sha256sum "${DEB_NAME}" >SHA256SUMS)
 {
 	echo "Package:        mpd ${NEW_VERSION} (${DEB_ARCH})"
 	echo "Rebuilt from:   mpd ${DEBIAN_VERSION} (Debian trixie source)"
-	echo "Release tag:    ${TAG}"
+	echo "Tag:            ${TAG}"
 	echo "Direct libs:    ${needed}"
 	echo "Total libs:     ${total} (Debian's build: 328)"
 	echo
-	echo "For constants.env:"
+	echo "To use: copy ${DEB_NAME} to install_resources/ and set in constants.env:"
 	echo "  MPD_DEB_TAG=${TAG}"
-	echo "  MPD_DEB_SHA256=$(cut -d' ' -f1 "$OUT_DIR/SHA256SUMS")"
 	echo
 	echo "Meson options:"
 	printf '  %s\n' "${MESON_OPTIONS[@]}"
@@ -253,11 +247,7 @@ total="$(ldd /usr/bin/mpd | grep -c '=>')"
 
 cat "$OUT_DIR/build-info.txt"
 
-# For the workflow: the version and file name of what was built
+# The workflow names the artifact after the tag
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-	{
-		echo "version=${NEW_VERSION}"
-		echo "deb=${DEB_NAME}"
-		echo "tag=${TAG}"
-	} >>"$GITHUB_OUTPUT"
+	echo "tag=${TAG}" >>"$GITHUB_OUTPUT"
 fi

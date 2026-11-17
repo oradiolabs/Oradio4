@@ -838,37 +838,32 @@ install_resource "$RESOURCES_PATH/asound.conf" /etc/asound.conf \
 	"aplay -D $SYSTEM_SOUND_SINK /dev/zero -f FLOAT_LE -c 2 -r 44100 -d 1"
 # Replace Debian's mpd with the minimal Oradio build.
 #
-# Debian's mpd loads 328 shared libraries (Samba, ffmpeg, ICU, PulseAudio, ...)
-# before it reads its config: ~4 s on a cold Pi 3A+, during which it competes
-# with oradio.service for the SD card. The minimal build (alsa, curl, mpg123,
-# id3tag, zlib, icu, systemd) loads about 45. See tools/build-mpd-minimal.sh.
+# Debian's mpd loads 328 shared libraries before it reads its config: ~4 s on a
+# cold Pi 3A+, competing with oradio.service for the SD card. The minimal build
+# loads 46. It is Debian's package rebuilt with fewer features, so units, user,
+# paths and conffiles stay the same. See tools/build-mpd-minimal.sh.
 #
-# It is the same Debian package rebuilt with fewer features, so units, user,
-# paths and conffiles stay the same. Held afterwards, so pkg-helper.sh does not
-# "upgrade" it back to Debian's build. Checked against MPD_DEB_SHA256 before it
-# is installed. Any failure leaves Debian's mpd in place, which works, only
-# slower to start: reported, not fatal.
+# Installed from install_resources/<MPD_DEB_TAG>_<arch>.deb when its version
+# differs from the installed one, then held so pkg-helper.sh does not replace it
+# with Debian's build. On any failure Debian's mpd stays: it works, only starts
+# slower. Reported, not fatal.
 if [ -n "${MPD_DEB_TAG:-}" ]; then
 	MPD_HAVE="$(dpkg-query -W -f='${Version}' mpd 2>/dev/null || true)"
-	if [ "mpd-${MPD_HAVE//[+:~]/-}" = "$MPD_DEB_TAG" ]; then
-		echo "Minimal MPD $MPD_HAVE already installed"
-		sudo apt-mark hold mpd >/dev/null
+	MPD_DEB_FILE="$RESOURCES_PATH/${MPD_DEB_TAG}_$(dpkg --print-architecture).deb"
+	if [ ! -f "$MPD_DEB_FILE" ]; then
+		echo -e "${YELLOW}$MPD_DEB_FILE not found: keeping mpd ${MPD_HAVE:-none}${NC}"
+		INSTALL_ERROR=1
 	else
-		MPD_DEB_FILE="$(mktemp --suffix=.deb)"
-		MPD_DEB_URL="https://github.com/oradiolabs/Oradio4/releases/download/${MPD_DEB_TAG}/${MPD_DEB_TAG}_$(dpkg --print-architecture).deb"
-		echo "Installing minimal MPD from $MPD_DEB_URL..."
-		if ! curl -fsSL --retry 3 -o "$MPD_DEB_FILE" "$MPD_DEB_URL"; then
-			echo -e "${YELLOW}Could not download minimal MPD: keeping mpd ${MPD_HAVE:-none}${NC}"
-			INSTALL_ERROR=1
-		elif ! echo "$MPD_DEB_SHA256  $MPD_DEB_FILE" | sha256sum -c --quiet --status; then
-			echo -e "${YELLOW}Minimal MPD checksum does not match MPD_DEB_SHA256: not installed${NC}"
-			INSTALL_ERROR=1
+		# Read from the package itself, not derived from the file name
+		MPD_WANT="$(dpkg-deb -f "$MPD_DEB_FILE" Version 2>/dev/null || true)"
+		if [ -n "$MPD_WANT" ] && [ "$MPD_HAVE" = "$MPD_WANT" ]; then
+			echo "Minimal MPD $MPD_HAVE already installed"
+			sudo apt-mark hold mpd >/dev/null
 		else
-			# Unhold first: apt refuses to replace a held package. --force-confold
-			# keeps Oradio's /etc/mpd.conf; it is installed again just below anyway.
+			echo "Installing minimal MPD ${MPD_WANT:-?} from $MPD_DEB_FILE..."
+			# apt does not replace a held package. --force-confold keeps Oradio's
+			# /etc/mpd.conf, which is installed again just below anyway.
 			sudo apt-mark unhold mpd >/dev/null 2>&1 || true
-			# _apt cannot read a file in our private tmp dir; give it one it can
-			chmod 0644 "$MPD_DEB_FILE"
 			if sudo apt-get install -y -q --allow-downgrades \
 					-o Dpkg::Options::=--force-confold "$MPD_DEB_FILE"; then
 				sudo apt-mark hold mpd >/dev/null
@@ -878,7 +873,6 @@ if [ -n "${MPD_DEB_TAG:-}" ]; then
 				INSTALL_ERROR=1
 			fi
 		fi
-		rm -f "$MPD_DEB_FILE"
 	fi
 else
 	echo "MPD_DEB_TAG not set: keeping Debian's mpd"
