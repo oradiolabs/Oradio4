@@ -82,6 +82,12 @@ gpio=24=op,dh
 gpio=25=op,dh
 gpio=7=op,dh
 gpio=15=op,dh
+# Boot indicator: the kernel blinks the STOP LED (1.0 s cycle, the timer
+# trigger default) from early in its start until oradio-bootblink.sh takes
+# over. That script MUST unbind this LED before oradio.service runs: while the
+# kernel holds GPIO 23, GPIO.setup() in GPIOService fails. Keep the pin equal
+# to LED_STOP_PIN in constants.env.
+dtoverlay=gpio-led,gpio=23,active_low=1,label=bootblink,trigger=timer
 # Leds on board off
 dtparam=pwr_led_trigger=none
 dtparam=pwr_led_activelow=on

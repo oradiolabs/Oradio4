@@ -1,0 +1,119 @@
+#!/usr/bin/bash
+#
+#  ####   #####     ##    #####      #     ####
+# #    #  #    #   #  #   #    #     #    #    #
+# #    #  #    #  #    #  #    #     #    #    #
+# #    #  #####   ######  #    #     #    #    #
+# #    #  #   #   #    #  #    #     #    #    #
+#  ####   #    #  #    #  #####      #     ####
+#
+# Created on November 17, 2026
+# @author:        Henk Stevens & Olaf Mastenbroek & Onno Janssen
+# @copyright:     Stichting Oradio
+# @license:       GNU General Public License (GPL)
+# @organization:  Stichting Oradio
+# @version:       2
+# @email:         info@stichtingoradio.nl
+# @status:        Development
+# @Purpose:       Show "busy" on the STOP LED while the Oradio boots
+#
+# Placeholders will be modified by ../oradio_install.sh script
+#
+# Started by oradio-bootblink.service as soon as systemd runs. Before that:
+#  - firmware: the STOP LED is lit steadily by 'gpio=23=op,dl' in config.txt
+#  - kernel:   the gpio-led overlay in config.txt blinks it with the timer
+#              trigger (500/500 ms, the same 1.0 s cycle)
+#
+# KERNEL HANDOVER
+# While the kernel's leds-gpio driver holds GPIO 23, GPIO.setup() in
+# GPIOService fails with "busy". So the first thing this script does is unbind
+# the leds-gpio device that owns the boot LED.
+#
+# The overlay creates a platform device of its own for it, named after the pin
+# in hex ("leds@17" for GPIO 23). The board's own "leds" device holds ACT and
+# PWR and must be left alone. The device is therefore looked up through the
+# LED's 'device' link rather than by a fixed name, so a different pin still
+# finds the right one.
+#
+# Blinks the STOP LED in the same rhythm as STARTUP_BLINK_CYCLE in
+# oradio_control.py, and stops as soon as the first sound plays. That is the
+# start-up tune (or SOUND_POWER_ERROR), and oradio_control.py sets the LED
+# itself right next to playing it. No handover with Python is needed.
+#
+# WHY THIS DOES NOT FIGHT GPIOService
+# pinctrl writes the pad register directly and claims no GPIO line, so it keeps
+# working after GPIOService has claimed the pin, and GPIOService is not
+# disturbed by it either. Between LEDControl() and the first sound,
+# oradio_control.py does not drive the STOP LED (apart from the power-error
+# path, which plays a sound and so stops this script), so only this script
+# drives it. The one-off 'initial=HIGH' from GPIO.setup() is overwritten at
+# the next half cycle.
+#
+# HOW "A SOUND PLAYS" IS DETECTED
+# Every sound goes through dmix to the DigiAMP+ hw device. While nothing plays,
+# its substream status reads "closed". The first line is read with the 'read'
+# builtin, so polling costs no fork. Before the card registers, the file does
+# not exist and the script just keeps blinking.
+#
+# The LEDs are active-low: 'dl' turns the LED ON, 'dh' turns it OFF.
+
+set -u
+
+readonly PIN="PLACEHOLDER_LED_STOP_PIN"
+readonly PCM_STATUS="/proc/asound/DigiAMP/pcm0p/sub0/status"
+
+# Ticks of 100 ms; the LED changes every 5 ticks, i.e. a 1.0 s cycle, the same
+# as STARTUP_BLINK_CYCLE.
+readonly TICK=0.1
+readonly TICKS_PER_HALF_CYCLE=5
+
+# Give up after this long: if no sound has played by then, blinking "busy"
+# would be a lie. The LED is left ON, the config.txt state.
+readonly MAX_SECONDS=120
+
+sound_playing() {
+	local line=""
+	[[ -r "$PCM_STATUS" ]] || return 1
+	read -r line <"$PCM_STATUS" || return 1
+	[[ "$line" != "closed" ]]
+}
+
+# Release GPIO 23 from the kernel, see KERNEL HANDOVER above. Only when the boot
+# LED is actually there, so a config.txt without the overlay still works.
+readonly KERNEL_LED="/sys/class/leds/bootblink"
+readonly LEDS_DRIVER="/sys/bus/platform/drivers/leds-gpio"
+if [[ -e "$KERNEL_LED" ]]; then
+	led_device=""
+	[[ -e "$KERNEL_LED/device" ]] && led_device="$(basename "$(readlink -f "$KERNEL_LED/device")")"
+	if [[ -n "$led_device" && -e "$LEDS_DRIVER/$led_device" ]]; then
+		echo "$led_device" >"$LEDS_DRIVER/unbind" \
+			|| echo "WARNING: could not unbind $led_device; GPIO $PIN stays claimed" >&2
+	else
+		echo "WARNING: no leds-gpio device found for $KERNEL_LED; GPIO $PIN stays claimed" >&2
+	fi
+	# Say so if it did not work: oradio.service is about to fail on it
+	[[ -e "$KERNEL_LED" ]] && echo "WARNING: $KERNEL_LED still present after unbind" >&2
+fi
+
+# Fork-free sleep: 'read -t' on a pipe nobody writes to times out after TICK.
+# An external 'sleep' every 100 ms cost about 1 s of CPU over a boot, on a
+# machine that is busy booting.
+exec {tick_fd}<> <(:)
+
+tick=0
+while (( SECONDS < MAX_SECONDS )); do
+	sound_playing && exit 0
+	if (( tick % TICKS_PER_HALF_CYCLE == 0 )); then
+		# Start with OFF: the LED is already on, so the first change is visible
+		if (( (tick / TICKS_PER_HALF_CYCLE) % 2 == 0 )); then
+			pinctrl set "$PIN" op dh
+		else
+			pinctrl set "$PIN" op dl
+		fi
+	fi
+	read -rt "$TICK" -u "$tick_fd" _
+	(( tick++ ))
+done
+
+pinctrl set "$PIN" op dl
+exit 0
