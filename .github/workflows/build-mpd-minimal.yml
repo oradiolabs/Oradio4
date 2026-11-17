@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build
         id: build
@@ -52,7 +52,7 @@ jobs:
         run: bash tools/build-mpd-minimal.sh
 
       - name: Keep as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.build.outputs.tag }}
           path: dist/
@@ -60,7 +60,7 @@ jobs:
 
       - name: Publish release
         if: ${{ inputs.release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.build.outputs.tag }}
           name: "Minimal MPD ${{ steps.build.outputs.version }}"
