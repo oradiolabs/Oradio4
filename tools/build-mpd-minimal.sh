@@ -28,13 +28,13 @@
 # radio streams. System sounds are WAV and go through aplay. This build keeps:
 #   output    alsa
 #   input     file, curl
-#   decoder   mpg123, pcm
+#   decoder   mpg123 (files), mad (MP3 streams by MIME type), pcm
 #   tags      id3tag
 #   database  simple, gzip-compressed (zlib)
 #   search    Unicode case folding (icu)
 #   playlist  m3u, extm3u, pls
 #   other     systemd notify and socket activation, tcp, unix socket, ipv6
-# 46 libraries in total. Everything else is off.
+# 47 libraries in total. Everything else is off.
 #
 # mpd.conf needs no change: MPD ignores 'sticker_file' without SQLite (Oradio
 # uses no stickers) and blocks for plugins that are not built (hybrid_dsd,
@@ -55,6 +55,11 @@
 # File name: the version with '+' as '-', e.g.
 # mpd-0.24.4-1-oradio.20261117_arm64.deb. The part before '_arm64.deb' is the
 # tag that goes into MPD_DEB_TAG in constants.env.
+#
+# TEST
+# The installed package must play an MP3 stream with and without .mp3 in its
+# URL and an MP3 file: see tools/test-mpd-minimal.sh. A build that fails it
+# stops here, so there is no artifact to put in install_resources/.
 #
 # WHERE
 # As root in a debian:trixie arm64 container, see
@@ -82,6 +87,12 @@ MESON_OPTIONS=(
 	-Dalsa=enabled
 	-Dcurl=enabled
 	-Dmpg123=enabled
+	# Web radio. MPD picks a decoder for a stream by MIME type, then by the
+	# URL's suffix, then falls back to "ffmpeg" or "mad". mpg123 registers the
+	# suffix .mp3 only, so a stream such as icecast.omroep.nl/radio2-bb-mp3
+	# (audio/mpeg, no .mp3) got "no decoder plugin". mad registers audio/mpeg
+	# and is the fallback. One small library (libmad0).
+	-Dmad=enabled
 	-Did3tag=enabled
 	# tag_cache and install_resources/mpd.database are gzip-compressed.
 	# Without zlib MPD calls them corrupted and rescans the whole stick.
@@ -127,6 +138,7 @@ fi
 
 MPD_VERSION="${MPD_VERSION:-}"
 BUILD_DATE="$(date -u +%Y%m%d)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$(realpath -m "${OUT_DIR:-dist}")"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -196,7 +208,7 @@ fi
 # ---------------------------------------------------------------------------
 {
 	printf 'mpd (%s) trixie; urgency=medium\n\n' "$NEW_VERSION"
-	printf '  * Minimal build for Oradio: alsa, curl, mpg123, id3tag, zlib, icu,\n'
+	printf '  * Minimal build for Oradio: alsa, curl, mpg123, mad, id3tag, zlib, icu,\n'
 	printf '    systemd.\n'
 	printf '    Built by tools/build-mpd-minimal.sh in oradiolabs/Oradio4.\n\n'
 	printf ' -- Stichting Oradio <info@stichtingoradio.nl>  %s\n\n' "$(date -R)"
@@ -224,6 +236,16 @@ cp "$DEB_BUILT" "$OUT_DIR/${DEB_NAME}"
 # Installing it here also checks that its dependencies resolve on trixie
 apt-get install -y -q "$OUT_DIR/${DEB_NAME}"
 
+# Play a web radio stream, an MP3 URL and a file with it, and stop the build if
+# one fails. tools/test-mpd-minimal.sh is next to this script.
+apt-get install -y -q --no-install-recommends lame python3
+PLAYBACK_RESULT="$(bash "$SCRIPT_DIR/test-mpd-minimal.sh" /usr/bin/mpd)" || {
+	echo "$PLAYBACK_RESULT"
+	echo "Playback test failed: not keeping this build" >&2
+	exit 1
+}
+echo "$PLAYBACK_RESULT"
+
 needed="$(readelf -d /usr/bin/mpd | grep -c NEEDED)"
 total="$(ldd /usr/bin/mpd | grep -c '=>')"
 {
@@ -235,6 +257,8 @@ total="$(ldd /usr/bin/mpd | grep -c '=>')"
 	echo
 	echo "To use: copy ${DEB_NAME} to install_resources/ and set in constants.env:"
 	echo "  MPD_DEB_TAG=${TAG}"
+	echo
+	echo "$PLAYBACK_RESULT"
 	echo
 	echo "Meson options:"
 	printf '  %s\n' "${MESON_OPTIONS[@]}"

@@ -1,8 +1,10 @@
-# Builds the minimal MPD package for Oradio: see tools/build-mpd-minimal.sh.
+# Builds and playback-tests the minimal MPD package for Oradio: see
+# tools/build-mpd-minimal.sh and tools/test-mpd-minimal.sh.
 #
-# Runs on a push that changes the build script or this workflow, on GitHub's
-# arm64 runner in a debian:trixie container, and keeps the result as an
-# artifact. To use a build:
+# Runs on a push that changes the build or test script or this workflow, on
+# GitHub's arm64 runner in a debian:trixie container, and keeps the result as an
+# artifact. A build that fails the playback test leaves no artifact. To use a
+# build:
 #   1. Download the artifact and check build-info.txt in it.
 #   2. Replace the .deb in install_resources/ with the one from the artifact.
 #      install_resources/ holds exactly one MPD .deb.
@@ -16,6 +18,7 @@ on:
   push:
     paths:
       - tools/build-mpd-minimal.sh
+      - tools/test-mpd-minimal.sh
       - .github/workflows/build-mpd-minimal.yml
 
 permissions:
