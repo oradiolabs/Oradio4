@@ -236,6 +236,12 @@ CMDLINE_REMOVE=(
 	fastboot				# Old Raspbian "skip fsck"; superseded by fsck.mode=
 	elevator				# Kernel logs "does not have any effect anymore"; use sysfs per device
 
+	# Raspberry Pi Imager adds 'ds=nocloud;i=rpi-imager-<id>' to point cloud-init
+	# at the user-data on the boot partition. Only cloud-init reads it, and
+	# cloud-init is purged above (PACKAGES_TO_REMOVE). If cloud-init is ever kept
+	# for per-device provisioning (see the warning there), remove this entry too.
+	ds
+
 	# Versions v1.0.1 to v1.0.4 had 'usb-storage.quirks=0781:5583:u', forcing the
 	# usb-storage driver for SanDisk stick 0781:5583. Obsolete, so removed if present.
 	# NOTE: Removed by KEY, so any quirk for any device goes, not just that VID:PID.
