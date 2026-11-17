@@ -304,9 +304,19 @@ class USBObserver(FileSystemEventHandler):
         calls and an os.sync() -- ran on whichever thread published the drive:
         watchdog's dispatch thread, so a removal event queued behind it, or the
         main thread inside USBService.start(), while holding locks.
+
+        Nothing to wait for when the drive has no credentials file, which is
+        nearly always: then no starter and no thread. Checked here as well as
+        in _import_usb_wifi_networks(), because waiting for NetworkManager
+        imports wifi_listener (dbus, GLib, nmcli), and at power-on that would
+        land in the busiest part of the boot for a file that is not there.
         """
         with self._state_lock:
             self._cancel_wifi_import()
+
+            if not path.isfile(USB_WIFI_FILE):
+                oradio_log.debug("No '%s' on the drive: no WiFi credentials to import", USB_WIFI_FILE)
+                return
 
             self._wifi_import = DeferredStarter(
                 "USB wifi credential import",

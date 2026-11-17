@@ -249,9 +249,11 @@ log_startup_step("led control")
 VolumeControl().start()
 log_startup_step("volume control")
 
-# Instantiate and start the wifi service for monitoring wifi state
+# Instantiate the wifi service. Started after the start-up tune, below: starting
+# it imports wifi_listener (dbus, GLib, nmcli), a third of all start-up imports,
+# and nothing before the tune needs WiFi -- except a power supply error, which
+# starts it itself.
 oradio_wifi_service = WifiService()
-oradio_wifi_service.start()
 log_startup_step("wifi service")
 
 # Seconds between checks while waiting for WiFi to carry the power supply
@@ -284,13 +286,15 @@ if power_status is False:
     # Inform the user to use the original power supply
     play_sound(SOUND_POWER_ERROR)
 
-    # Report to RMS, but not before WiFi can carry it.
+    # Report to RMS, but not before WiFi can carry it. WiFi is otherwise started
+    # after the start-up tune, which this Oradio never reaches.
     #
     # send_message() holds an incident while WiFi is down or the clock is not
     # ready, and sends it once both are, so this wait is not what keeps the
-    # report from being lost. It makes the order explicit: at this point in
-    # start-up WifiService has usually only just handed its own start to a
-    # background thread, and RMS has not seen a WIFI_CONNECTED message yet.
+    # report from being lost. It makes the order explicit: WifiService has only
+    # just handed its start to a background thread, and RMS has not seen a
+    # WIFI_CONNECTED message yet.
+    oradio_wifi_service.start()
     #
     # Waiting has no cost. The Oradio is not going to serve this user again
     # either way, so the only thing left to accomplish is telling RMS why. An
@@ -1030,7 +1034,9 @@ class StateMachine:
         """
         leds.control_blinking_led(LED_PLAY, STARTUP_BLINK_CYCLE)
 
-        if retry_if_not_ready and not mpd_control.wait_for_library(0):
+        # Prepared, not scanned: MPD plays from the database it loaded while the
+        # update runs. play() answers None if that is not enough, see below.
+        if retry_if_not_ready and not mpd_control.library_prepared():
             oradio_log.info("Play pressed before the library was ready")
             self._start_library_retry(
                 "Play", lambda: self._play_current(retry_if_not_ready=False),
@@ -1038,6 +1044,17 @@ class StateMachine:
             return
 
         result = mpd_control.play()
+
+        # The default preset is only in the update MPD is still running: wait
+        # for it with the LED blinking, as a preset button does. Once only, so
+        # a play() that still has nothing after the update is not retried.
+        if result is None and retry_if_not_ready:
+            oradio_log.info("Play pressed before the library update had finished")
+            self._start_library_retry(
+                "Play", lambda: self._play_current(retry_if_not_ready=False),
+            )
+            return
+
         if web_service_active.is_set():
             leds.control_blinking_led(LED_PLAY, WEBSERVICE_BLINK_CYCLE)
         else:
@@ -1109,7 +1126,11 @@ class StateMachine:
         # lives on the stick, which on a cold boot may still be in fsck, and
         # every question below would come back as "empty preset". Wait for it
         # with the LED blinking, rather than announce something untrue.
-        if retry_if_not_ready and not mpd_control.wait_for_library(0):
+        #
+        # Prepared, not scanned: MPD plays from the database it loaded while the
+        # update runs. A preset only the update can find makes play() answer
+        # None, and that press waits for the update below.
+        if retry_if_not_ready and not mpd_control.library_prepared():
             oradio_log.info("Preset '%s' pressed before the library was ready", preset)
             self._start_library_retry(
                 preset, lambda: self._play_preset(preset, retry_if_not_ready=False),
@@ -1863,6 +1884,13 @@ threading.Thread(
 
 # Subscribe to and dispatch all command messages (starts its own worker thread)
 oradio_command_handler = OradioCommandHandler(Commands.subscribe())
+
+# Start monitoring WiFi now the tune is playing and the buttons are live. Returns
+# at once: waiting for NetworkManager, importing wifi_listener and starting the
+# D-Bus listener all happen on WifiService's own thread. Its state messages reach
+# the command handler above, and RMS, through the bus as before.
+oradio_wifi_service.start()
+log_startup_step("wifi service started")
 
 def main() -> None:
     """

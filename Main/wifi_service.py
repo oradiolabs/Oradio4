@@ -21,10 +21,11 @@ Created on December 23, 2024
     NetworkManager connection profiles all live here, as does every name other modules are meant to import. State
     changes are reported on the messaging bus by the WifiEventListener that this module starts and stops.
     Import from here, not from wifi_listener: that module is an implementation detail, and the names it owns
-    (get_wifi_connection, get_wifi_networks, nm_available) are re-exported below. __all__ lists the supported surface.
+    (get_wifi_connection, get_wifi_networks, nm_available) are passed through below. __all__ lists the supported surface.
     WifiService composes a WifiEventListener (built on ThreadTemplate, utilities.py) and exposes explicit
     start()/stop() methods, so the D-Bus listener thread is only started when the caller asks for it rather than
-    as a side effect of construction.
+    as a side effect of construction. wifi_listener and nmcli are imported on first use, not with this module:
+    see "Deferred imports" below.
     Access-point timing is owned here: callers start the access point and ask await_access_point() for the verdict
     rather than polling against a deadline of their own.
     Documentation:
@@ -36,7 +37,8 @@ Created on December 23, 2024
 """
 from time import sleep, monotonic
 from threading import Thread, Lock, Event
-import nmcli
+from importlib import import_module
+from types import ModuleType
 
 ##### Oradio modules ######################################
 from singleton import singleton
@@ -54,15 +56,6 @@ from messaging import (
     WIFI_DISCONNECT_FAILED,
     WIFI_AP_FAILED,
 )
-from wifi_listener import (
-    AP_SCAN_SWEEPS,
-    NM_CONNECTIVITY_FULL,
-    WifiEventListener,
-    nm_available,
-    nmcli_try,
-    get_wifi_connection,
-    get_wifi_networks,
-)
 
 ##### GLOBAL constants ####################################
 from constants import (
@@ -71,8 +64,7 @@ from constants import (
 )
 
 # Supported import surface. get_wifi_connection, get_wifi_networks and nm_available are implemented in wifi_listener
-# and re-exported here so callers have one module to import from; listing them keeps pylint from reporting the
-# re-export as an unused import.
+# and passed through below, so callers have one module to import from and do not import wifi_listener themselves.
 __all__ = [
     "WifiService",
     "get_saved_network",
@@ -123,6 +115,38 @@ LISTENER_START_TIMEOUT = 20.0
 _saved_network = {"network": ""}    # WiFi SSID that was active when wifi_connect() last replaced it
 _saved_lock = Lock()                # Guards concurrent reads and writes
 
+##### Deferred imports ####################################
+
+# wifi_listener and nmcli are imported on first use, not when this module is imported. wifi_listener pulls in
+# dbus-python, GLib (and with it asyncio) and nmcli: 0.47 s on a cold Pi 3A+, a third of everything oradio_control
+# imports, in the busiest part of the boot. Nothing needs them before the start-up tune, yet usb_service and
+# web_service import this module while oradio_control starts. Python caches the import, so every later call is a
+# dictionary lookup.
+
+def _listener_module() -> ModuleType:
+    """Return wifi_listener, importing it on first use."""
+    return import_module("wifi_listener")
+
+def _nmcli() -> ModuleType:
+    """Return nmcli, importing it on first use."""
+    return import_module("nmcli")
+
+def nm_available() -> bool:
+    """Report whether NetworkManager owns its D-Bus name. See wifi_listener.nm_available()."""
+    return _listener_module().nm_available()
+
+def get_wifi_connection() -> str | None:
+    """Return the active WiFi connection, if any. See wifi_listener.get_wifi_connection()."""
+    return _listener_module().get_wifi_connection()
+
+def get_wifi_networks() -> list | None:
+    """Return the maintained list of WiFi networks. See wifi_listener.get_wifi_networks()."""
+    return _listener_module().get_wifi_networks()
+
+def nmcli_try(func, *args, **kwargs):
+    """Call an nmcli function and report the outcome. See wifi_listener.nmcli_try()."""
+    return _listener_module().nmcli_try(func, *args, **kwargs)
+
 ##### Helpers #############################################
 
 def _set_saved_network(network) -> None:
@@ -164,7 +188,7 @@ def _wifi_up(network) -> bool:
         True if activation succeeded, False otherwise.
     """
     oradio_log.info("Activate '%s'", network)
-    is_ok, _ = nmcli_try(nmcli.connection.up, network)
+    is_ok, _ = nmcli_try(_nmcli().connection.up, network)
     return is_ok
 
 def _wifi_down(network) -> bool:
@@ -178,11 +202,11 @@ def _wifi_down(network) -> bool:
         True if deactivation succeeded, False otherwise.
     """
     oradio_log.info("Disconnect from: '%s'", network)
-    is_ok, _ = nmcli_try(nmcli.connection.down, network)
+    is_ok, _ = nmcli_try(_nmcli().connection.down, network)
     return is_ok
 
 @singleton
-class WifiService:
+class WifiService:    # pylint: disable=too-many-instance-attributes
     """
     Manage WiFi connection state and expose connect/disconnect operations.
 
@@ -190,7 +214,8 @@ class WifiService:
     connection failed. State changes are reported on the command message bus by the WifiEventListener singleton;
     this class handles the active operations that trigger them.
 
-    Construction only sets up state; the background D-Bus listener thread is not started until start() is called.
+    Construction only sets up state; the WifiEventListener is created on first use and its D-Bus thread is not
+    started until start() is called. Neither imports wifi_listener before then.
 
     Singleton, because oradio_control and web_service each construct one and they must not diverge: the
     network list, its readiness flag and the listener thread describe one radio, not one per caller. Keep any state
@@ -204,19 +229,16 @@ class WifiService:
     """
     def __init__(self) -> None:
         """
-        Create (but do not start) the WifiEventListener singleton.
+        Set up state. The WifiEventListener is created on first use (see nm_listener) and started by start().
 
         The singleton decorator ensures this constructor runs at most once per process. Callers must call start()
         explicitly to begin monitoring D-Bus state changes, and may stop()/start() again later since the listener
         is restartable.
         """
-        # Singleton D-Bus listener; every WifiService shares this one instance.
-        self.nm_listener = WifiEventListener()
-
-        # Run the scan burst and seed the bus after every successful listener setup, not only after the one
-        # _start_listener() waited for: a listener that crashed in its first setup() and came back on an automatic
-        # restart has nobody waiting on it. See _listener_ready().
-        self.nm_listener.on_ready = self._listener_ready
+        # Singleton D-Bus listener; every WifiService shares this one instance. Created on first use by the
+        # nm_listener property, so constructing a WifiService does not import wifi_listener.
+        self._nm_listener = None
+        self._nm_listener_lock = Lock()
 
         # Generation of the startup scan burst, bumped by stop(). A burst thread carries the generation it was
         # started for and touches list_ready only while that is still current, so a thread from a stopped cycle --
@@ -258,27 +280,51 @@ class WifiService:
         #
         # on_timeout fires only when NM never appeared, which is the case worth an incident: masked, disabled or
         # failed to start. A stop() that cancelled the wait is not, hence the _stopping check.
+        #
+        # inline=False: the availability check and the start both import wifi_listener and talk D-Bus, and the
+        # caller -- oradio_control, right after the start-up tune -- must not wait for either.
         self._starter = DeferredStarter(
             "WiFi event listener",
             nm_available,
             self._start_listener,
             on_timeout=self._report_nm_missing,
             poll_interval=NM_POLL_INTERVAL,
+            inline=False,
         )
+
+    @property
+    def nm_listener(self):
+        """
+        The WifiEventListener, created on first use.
+
+        Creating it imports wifi_listener (dbus, GLib, nmcli), which is why it is not done in __init__. The first
+        caller is normally the background thread of start(); a caller that needs the listener earlier creates it
+        on its own thread, which is correct, only not free.
+
+        Returns:
+            The shared WifiEventListener singleton, with on_ready set to _listener_ready().
+        """
+        with self._nm_listener_lock:
+            if self._nm_listener is None:
+                listener = _listener_module().WifiEventListener()
+                # Run the scan burst and seed the bus after every successful listener setup, not only after the one
+                # _start_listener() waited for: a listener that crashed in its first setup() and came back on an
+                # automatic restart has nobody waiting on it. See _listener_ready().
+                listener.on_ready = self._listener_ready
+                self._nm_listener = listener
+            return self._nm_listener
 
     def start(self, wait: float = NM_WAIT_TIMEOUT) -> None:
         """
         Start the background WiFi event listener thread and publish the current connection state.
 
-        If NetworkManager is already up, the listener starts synchronously and this returns once it is running. If
-        NetworkManager is not up yet, starting immediately would only make setup() fail on D-Bus and publish a
-        misleading WIFI_DBUS_FAILED, losing the listener -- and with it all state reporting and the network list --
-        for the rest of the boot. In that case the start is handed to a background thread that waits for NM to
-        appear.
+        Returns at once: the start runs on a background thread, which first waits for NetworkManager. Starting
+        before NM is up would only make setup() fail on D-Bus and publish a misleading WIFI_DBUS_FAILED, losing the
+        listener -- and with it all state reporting and the network list -- for the rest of the boot. Waiting turns
+        "started too early" into a short delay instead of a lost boot.
 
-        oradio_control starts after basic.target and the listener starts as early as module initialisation allows,
-        so the margin over NM claiming its bus name is only a few seconds and not guaranteed. Waiting turns "started
-        too early" into a short delay instead of a lost boot.
+        Always in the background, also when NM is already up: the check and the start import wifi_listener and talk
+        D-Bus, which costs the caller a second or more on a cold boot.
 
         Idempotent: a no-op if the listener is already running, or if another start() is still in progress --
         including one waiting in the background for NetworkManager.
@@ -290,7 +336,9 @@ class WifiService:
         # The listener being up is checked here rather than left to the starter: DeferredStarter knows whether it
         # has run do_start, not whether the thread it started is still alive. A listener that crashed and was
         # cleaned up should be startable again without a stop() in between.
-        if self.nm_listener.is_alive():
+        # Not via the nm_listener property: that would create the listener, and import wifi_listener, on the
+        # caller's thread.
+        if self._nm_listener is not None and self._nm_listener.is_alive():
             oradio_log.debug("WiFi event listener thread already running")
             return
 
@@ -438,15 +486,16 @@ class WifiService:
         Args:
             generation: The value of _list_generation when this burst was started.
         """
+        sweeps = _listener_module().AP_SCAN_SWEEPS
         before = _known_ssids()
         started = monotonic()
         found = before
 
         oradio_log.debug(
-            "Building network list: %d sweeps (%d networks known)", AP_SCAN_SWEEPS, len(before)
+            "Building network list: %d sweeps (%d networks known)", sweeps, len(before)
         )
 
-        for sweep in range(1, AP_SCAN_SWEEPS + 1):
+        for sweep in range(1, sweeps + 1):
             # Checked before is_alive(): after a quick stop() and start() the listener is alive again, but it is the
             # new cycle's listener, and that cycle runs its own burst.
             if self._list_generation != generation:
@@ -469,7 +518,7 @@ class WifiService:
             previous, found = found, _known_ssids()
             oradio_log.debug(
                 "Sweep %d of %d at %.1fs: %d networks (+%d)%s",
-                sweep, AP_SCAN_SWEEPS, monotonic() - started, len(found), len(found - previous),
+                sweep, sweeps, monotonic() - started, len(found), len(found - previous),
                 "" if completed else " [not confirmed complete]",
             )
 
@@ -513,15 +562,20 @@ class WifiService:
         self._starter.abort()
         self._starter.reset()
 
-        self.nm_listener.safe_stop()
+        # Never created means never started: no thread to stop, no list to clear. Not via the nm_listener property,
+        # which would create it -- and import wifi_listener -- only to stop it.
+        listener = self._nm_listener
+        if listener is not None:
+            listener.safe_stop()
 
         # A new generation, so a burst thread still in flight -- possibly in a scan_and_wait() that outlasts this
         # stop and the next start() -- stops sweeping and cannot report readiness for a list this stop has just
         # invalidated, or for the one the next cycle is building.
         with self._list_lock:
             self._list_generation += 1
-            self.nm_listener.list_building.clear()
-            self.nm_listener.list_ready.clear()
+            if listener is not None:
+                listener.list_building.clear()
+                listener.list_ready.clear()
 
     def has_connectivity(self) -> bool | None:
         """
@@ -549,12 +603,16 @@ class WifiService:
             False: it means there is no answer, and a caller deciding whether
             to refuse the user something should treat those differently.
         """
+        # Not created yet means not started yet: no answer, and no reason to import wifi_listener to say so
+        if self._nm_listener is None:
+            return None
+
         connectivity = self.nm_listener.get_connectivity()
 
         if connectivity is None:
             return None
 
-        return connectivity == NM_CONNECTIVITY_FULL
+        return connectivity == _listener_module().NM_CONNECTIVITY_FULL
 
     def get_state(self) -> str:
         """
@@ -899,7 +957,7 @@ def networkmanager_list() -> list:
     """
     oradio_log.debug("Get connections from NetworkManager")
 
-    is_ok, result = nmcli_try(nmcli.connection)
+    is_ok, result = nmcli_try(_nmcli().connection)
 
     if not is_ok or result is None:
         return []
@@ -935,7 +993,7 @@ def networkmanager_add(network, password=None) -> bool:
             "ipv4.method": "shared",
             "ipv4.address": ACCESS_POINT_HOST + "/24",
         }
-        is_ok, _ = nmcli_try(nmcli.connection.add, "wifi", options, "*", ACCESS_POINT_SSID, False)
+        is_ok, _ = nmcli_try(_nmcli().connection.add, "wifi", options, "*", ACCESS_POINT_SSID, False)
         return is_ok
 
     # --- Regular WiFi profile ---
@@ -952,12 +1010,12 @@ def networkmanager_add(network, password=None) -> bool:
     if network in networkmanager_list():
         # Profile exists; update credentials in place
         oradio_log.info("Modify '%s' in NetworkManager", network)
-        is_ok, _ = nmcli_try(nmcli.connection.modify, network, options)
+        is_ok, _ = nmcli_try(_nmcli().connection.modify, network, options)
         return is_ok
 
     # Profile does not exist; create a new one
     oradio_log.info("Add '%s' to NetworkManager", network)
-    is_ok, _ = nmcli_try(nmcli.connection.add, "wifi", options, "*", network, True)
+    is_ok, _ = nmcli_try(_nmcli().connection.add, "wifi", options, "*", network, True)
     return is_ok
 
 def networkmanager_del(network) -> bool:
@@ -974,7 +1032,7 @@ def networkmanager_del(network) -> bool:
         True if deletion succeeded, False otherwise.
     """
     oradio_log.info("Remove '%s' from NetworkManager", network)
-    is_ok, _ = nmcli_try(nmcli.connection.delete, network)
+    is_ok, _ = nmcli_try(_nmcli().connection.delete, network)
     return is_ok
 
 ##### Stand-alone entry point #############################

@@ -285,6 +285,26 @@ class MPDControl(MPDService):
         # runs on a fresh Thread (see ThreadTemplate.safe_start()). See play_song().
         self._song_monitor = _SongFinishMonitor(self)
 
+    def library_prepared(self) -> bool:
+        """
+        Whether the library has been prepared at least once, scan or no scan.
+
+        True once initialise_library() has checked the playlists and presets
+        and asked MPD to update its database. The update itself may still be
+        running: MPD keeps serving the database it loaded at start-up, which is
+        the library as it was at the last shutdown, so a preset can play from
+        it straight away.
+
+        For the first check on a button press, at start-up typically 1-2 s
+        before the update has finished. A press that finds nothing to play in
+        the old database -- a preset directory that is new on the stick --
+        gets None from play() and waits for the update via wait_for_library().
+
+        Returns:
+            True if initialise_library() has completed at least once.
+        """
+        return self._library_ready.is_set()
+
     def wait_for_library(self, timeout: float | None = None) -> bool:
         """
         Block until the music library has been prepared at least once, and MPD
