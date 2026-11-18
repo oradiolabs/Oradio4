@@ -22,6 +22,8 @@ Created on Januari 31, 2025
 
 """
 import threading
+import os
+import signal
 from os.path import ismount
 from time import sleep
 
@@ -44,6 +46,8 @@ from incident_service import IncidentHandler
 from log_monitor import LogHealthMonitor
 from rpi_monitor import RPiThrottlingMonitor
 from power_service import get_power_status
+from music_card_control import handle_card_event
+from nfc_bridge import NFCBridge
 
 # Message identifiers
 from messaging import (
@@ -735,6 +739,39 @@ class StateMachine:
         """Whether no transition has spawned a newer state worker since `generation`."""
         with self._lock:
             return generation == self._generation
+
+    def play_music_card(self, playlist: str) -> bool:
+        """Explicit playlist selection, including when already in StatePlay.
+
+        The command consumer calls this; never call from a state worker.
+        Serialise with state workers and hold bookkeeping through playback so
+        Stop/Error cannot be overtaken by this action. No NFC access here.
+        """
+        with self.task_lock:
+            with self._lock:
+                if self.state == "StateError" or not usb_present.is_set():
+                    return False
+                if not mpd_control.play_playlist(playlist):
+                    oradio_log.warning("Music card playlist unavailable: %s", playlist)
+                    return False
+                self._cancel_all_delayed()
+                self._generation += 1
+                self._handler_generation = self._generation
+                self._web_preset_change = None
+                self.prev_state = self.state
+                self.state = "StatePlay"
+                leds.turn_off_all_leds()
+                if web_service_active.is_set():
+                    leds.control_blinking_led(LED_PLAY, WEBSERVICE_BLINK_CYCLE)
+                else:
+                    leds.turn_on_led(LED_PLAY)
+                # Every accepted card is an explicit new start, including
+                # StatePlay -> StatePlay. The NFC reader suppresses repeated
+                # events while the same card remains present.
+                play_sound(SOUND_PLAY)
+                oradio_log.info("Music card state: %s -> StatePlay", self.prev_state)
+                oradio_log.info("Music card started playlist: %s", playlist)
+                return True
 
     def play_web_preset_change(self, preset: str) -> None:
         """
@@ -1778,6 +1815,10 @@ def handle_message(message: CommandMessage) -> None:
     Args:
         message: The CommandMessage to be processed.
     """
+    if message.source == "NFC" and message.message == "CARD":
+        handle_card_event(message.data, state_machine.play_music_card)
+        return
+
     command_source = message.source
     state          = message.message
 
@@ -1869,8 +1910,28 @@ def main() -> None:
     Main loop for oradio_control.
     """
     oradio_log.debug("Oradio control main loop running")
-    while True:
-        sleep(1)
+    # Opt-in during the demo rollout. Only this child owns the PN532.
+    bridge = None
+    if os.environ.get("ORADIO_NFC_ENABLED") == "1":
+        bridge = NFCBridge(
+            lambda event: Commands.publish(CommandMessage("NFC", "CARD", event)),
+            oradio_log,
+            ready=lambda: usb_present.is_set() and mpd_control.wait_for_library(0),
+        )
+        bridge.start()
+
+    def terminate(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        while True:
+            sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if bridge is not None:
+            bridge.stop()
 
 if __name__ == "__main__":
 
