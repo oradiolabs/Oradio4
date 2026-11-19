@@ -982,6 +982,10 @@ install_script "$RESOURCES_PATH/about" /usr/local/bin/about
 # Progress report
 echo -e "${GREEN}Support tools installed${NC}"
 
+# Configure the boot indicator: STOP LED blinks "busy" until the start-up tune
+install_script "$RESOURCES_PATH/oradio-bootblink.sh" /usr/local/sbin/oradio-bootblink.sh
+install_resource "$RESOURCES_PATH/oradio-bootblink.service" /etc/systemd/system/oradio-bootblink.service 'systemctl enable oradio-bootblink.service'
+
 # Configure the oradio crash handling script
 install_script "$RESOURCES_PATH/oradio-crash.sh" /usr/local/sbin/oradio-crash.sh 700
 # Configure the oradio crash handling service

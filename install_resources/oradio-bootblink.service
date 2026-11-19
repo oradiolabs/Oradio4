@@ -1,0 +1,25 @@
+# Installed as /etc/systemd/system/oradio-bootblink.service
+#
+# Blinks the STOP LED as "busy" from the moment systemd starts until the first
+# sound (the start-up tune) plays. See oradio-bootblink.sh.
+#
+# DefaultDependencies=no and WantedBy=sysinit.target: started at the very
+# beginning of the boot, not after basic.target. It only needs /usr/bin/pinctrl
+# on the root filesystem the kernel already mounted, and /run, which systemd
+# mounts itself before starting any unit.
+
+[Unit]
+Description=Oradio boot indicator (STOP LED blinks until the start-up tune)
+DefaultDependencies=no
+Conflicts=shutdown.target
+# oradio.service must not start before this script has released GPIO 23 from
+# the kernel. It does that within milliseconds of starting, long before
+# oradio.service is due, but the ordering makes it explicit.
+Before=shutdown.target oradio.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/oradio-bootblink.sh
+
+[Install]
+WantedBy=sysinit.target
