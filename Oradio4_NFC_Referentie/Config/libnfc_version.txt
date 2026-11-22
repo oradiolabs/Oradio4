@@ -1,0 +1,3 @@
+nfc-list uses libnfc 1.8.0
+usage: nfc-list [-v] [-t X]
+  -v	 verbose display

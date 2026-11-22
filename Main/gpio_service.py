@@ -56,7 +56,7 @@ from constants import (
 ##### LOCAL constants #####################################
 # LED GPIO PINS
 LEDS: dict[str, int] = {
-    LED_PLAY   : 15,
+    LED_PLAY   : 8,
     LED_STOP   : LED_STOP_PIN,
     LED_PRESET1: 24,
     LED_PRESET2: 25,

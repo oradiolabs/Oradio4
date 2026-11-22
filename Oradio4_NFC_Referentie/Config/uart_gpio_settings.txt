@@ -1,0 +1,6 @@
+59:#dtoverlay=disable-bt
+63:# LOAD-BEARING: GPIO15 is UART0 RXD. With disable-bt the PL011 moves to
+64:# GPIO14/15, which would fight the "gpio=15=op,dh" backlight setting below.
+66:enable_uart=1
+85:gpio=8=op,dh
+serial0 -> /dev/ttyS0

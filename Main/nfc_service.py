@@ -236,7 +236,7 @@ class NFCService:
         reader.guarded(lib.nfc_init, C.byref(context))
         if not context.value:
             raise RuntimeError('nfc_init mislukt')
-        device = reader.guarded(lib.nfc_open, context, b'pn532_i2c:/dev/i2c-1', seconds=12)
+        device = reader.guarded(lib.nfc_open, context, b'pn532_uart:/dev/serial0', seconds=12)
         if not device:
             raise RuntimeError('PN532 openen mislukt')
         reader.checked(lib, 'nfc_device_set_property_int', device, 0, 1000)
