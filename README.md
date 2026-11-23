@@ -27,6 +27,32 @@ required to prepare an SD card for an Oradio4.
 > service names and paths as Oradio3; the install script stops when it finds an
 > Oradio3 installation on the card.
 
+### PN7160 NFC hardware for `NFC-PN7160-Olaf`
+
+> [!IMPORTANT]
+> Music cards on this branch require a PN7160 reader. If your Oradio has a
+> PN532, replace the reader and update the wiring before testing NFC.
+> Shut down the Raspberry Pi and disconnect power before rewiring.
+
+The following setup was tested on a Raspberry Pi 3A+ with the Elechouse
+PN7160/1 Module V2. GPIO numbers below use BCM numbering.
+
+| Module signal | Tested connection |
+| --- | --- |
+| SDA | GPIO12, software I²C bus 8 |
+| SCL | GPIO13, software I²C bus 8 |
+| VEN | GPIO17 |
+| IRQ | GPIO27 |
+| VDD | 3.3 V |
+| VANT | 5 V |
+| GND | Raspberry Pi ground |
+
+Use a 2.2 kΩ pull-up to 3.3 V on each of SDA and SCL. The reader uses I²C
+address `0x28`. The branch installer configures `/dev/i2c-8` and enables
+the NFC service. The existing Oradio hardware continues to use bus 1.
+
+Use the branch installation command below with `NFC-PN7160-Olaf` as the branch name.
+
 Create an SD card using the Trixie 64bit Lite image:
 
 - Set hostname (e.g. oradio)
