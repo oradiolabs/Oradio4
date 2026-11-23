@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "description_nl": "Voorbeeldkoppelingen voor de Oradio4 NFC-demonstrator. Playlistnamen zijn exact overgenomen uit de aangeleverde MPD-lijst.",
+  "cards": {
+    "oradio:v1:card:theme:jaren_zestig": {
+      "name_nl": "Jaren 60",
+      "playlist": "Pop60s"
+    },
+    "oradio:v1:card:theme:jaren_zeventig": {
+      "name_nl": "Jaren 70",
+      "playlist": "Pop70s"
+    },
+    "oradio:v1:card:theme:jaren_tachtig": {
+      "name_nl": "Jaren 80",
+      "playlist": "Pop80s"
+    },
+    "oradio:v1:card:theme:levenslied": {
+      "name_nl": "Levenslied",
+      "playlist": "Nld_Levenslied_en_smartlappen"
+    },
+    "oradio:v1:card:theme:lichte_klassiek": {
+      "name_nl": "Lichte klassiek",
+      "playlist": "Klasssiek_light_happy"
+    },
+    "oradio:v1:card:artist:andre_rieu": {
+      "name_nl": "André Rieu",
+      "playlist": "KlassiekAndreRieu"
+    },
+    "oradio:v1:card:mood:ontspannen_klassiek": {
+      "name_nl": "Ontspannen klassiek",
+      "playlist": "Klassiek_Relax"
+    },
+    "oradio:v1:card:mood:vrolijke_jaren_70_pop": {
+      "name_nl": "Vrolijke jaren 70-pop",
+      "playlist": "Pop_Dans_hits_70s"
+    },
+    "oradio:v1:card:mood:meezingen": {
+      "name_nl": "Meezingen",
+      "playlist": "NldMeezing"
+    }
+  }
+}

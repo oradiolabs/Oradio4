@@ -10,6 +10,8 @@
 # Uncomment some or all of these to enable the optional hardware interfaces
 # i2c_arm is required: the PCM5122 on the DigiAMP+ is controlled over I2C
 dtparam=i2c_arm=on
+# PN7160 software I2C: GPIO12 SDA, GPIO13 SCL, /dev/i2c-8.
+dtoverlay=i2c-gpio,bus=8,i2c_gpio_sda=12,i2c_gpio_scl=13,i2c_gpio_delay_us=5
 # Redundant - the rpi-digiampplus overlay enables I2S itself - but harmless
 dtparam=i2s=on
 #dtparam=spi=on

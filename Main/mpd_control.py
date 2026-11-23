@@ -566,6 +566,56 @@ class MPDControl(MPDService):
     # those cases apart. The statement count is one over for the same reason,
     # plus the _playback_intent bump at the top.
     @_sequence
+    def play_playlist(self, playlist: str) -> bool:
+        """Play a stored playlist or music directory without changing presets.
+
+        The historical name is retained for the card adapter. As in play(),
+        a stored playlist takes precedence over a directory of the same name;
+        directories are added recursively and shuffled, playlists keep order.
+        Resolve before clearing so missing/empty sources leave playback alone.
+        MPD transport failures use the existing incident mechanism; this is
+        not a rollback transaction.
+        """
+        if not isinstance(playlist, str) or not playlist.strip():
+            return False
+        if not self._library_ready.is_set():
+            return False
+        names = self._execute("listplaylists") or []
+        is_playlist = any(isinstance(item, dict) and item.get("playlist") == playlist
+                          for item in names)
+        files = []
+        if is_playlist:
+            songs = self._execute("listplaylistinfo", playlist) or []
+            files = [song.get("file") for song in songs if isinstance(song, dict)]
+            if not files or any(not isinstance(uri, str) or not uri for uri in files):
+                return False
+        else:
+            if playlist not in self._disk_directories():
+                return False
+            # Same database count used by get_directories(): includes songs
+            # below subdirectories, unlike lsinfo of only the top level.
+            count = self._execute("count", "base", playlist) or {}
+            try:
+                if int(count.get("songs", 0)) <= 0:
+                    return False
+            except (TypeError, ValueError, AttributeError):
+                return False
+        self._playback_intent += 1
+        self._execute("clear")
+        if is_playlist:
+            # Use the validated playlist snapshot in its saved order.
+            for uri in files:
+                self._execute("add", uri)
+        else:
+            self._execute("add", playlist)
+            self._execute("shuffle")
+        self._execute("random", 0)
+        self._execute("repeat", 1)
+        self._execute("play", 0)
+        status = self._execute("status") or {}
+        return status.get("state") == "play"
+
+    @_sequence
     def play(self, preset: str | None = None) -> bool | None:  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements
         """
         Start or resume playback.

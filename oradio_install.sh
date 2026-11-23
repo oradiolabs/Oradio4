@@ -391,6 +391,8 @@ if [ "${1:-}" != "--continue" ]; then
 		python3-requests
 		python3-watchdog
 		python3-rpi-lgpio
+		python3-libgpiod
+		python3-smbus2
 	)
 
 	# Cleared here so a package set installed or upgraded below can set it.
@@ -910,6 +912,12 @@ install_resource "$RESOURCES_PATH/oradio-crash.service" /etc/systemd/system/orad
 # Configure the oradio prestart script
 install_script "$RESOURCES_PATH/oradio-prestart.sh" /usr/local/sbin/oradio-prestart.sh
 install_script "$RESOURCES_PATH/oradio-poststop.sh" /usr/local/sbin/oradio-poststop.sh
+# The NFC child uses this same interpreter, including after an installer reboot.
+if ! "$HOME/.venv/bin/python3" -c 'import gpiod; from smbus2 import SMBus, i2c_msg; assert callable(gpiod.request_lines)'; then
+	echo -e "${RED}PN7160 Python dependencies unavailable in the Oradio environment${NC}"
+	INSTALL_ERROR=1
+fi
+install_resource "$RESOURCES_PATH/95-nfc-demo.conf" /etc/systemd/system/oradio.service.d/95-nfc-demo.conf
 # Configure the oradio service to start on boot
 install_resource "$RESOURCES_PATH/oradio.service" /etc/systemd/system/oradio.service 'systemctl enable oradio.service'
 # Progress report
