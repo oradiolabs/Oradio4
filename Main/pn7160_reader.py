@@ -11,6 +11,9 @@ from typing import Callable, Optional
 CMD_RESET = bytes.fromhex("20 00 01 00")
 CMD_INIT = bytes.fromhex("20 01 02 00 00")
 CMD_PROP_ACT = bytes.fromhex("2F 02 00")
+CMD_GET_PMU_CFG = bytes.fromhex("20 03 03 01 A0 0E")
+PMU_CFG_RESPONSE_PREFIX = bytes.fromhex("40 03 10 00 01 A0 0E 0B")
+ELECHOUSE_5V_PMU_CFG = bytes.fromhex("11 01 C2 B2 00 B2 1E 1F 00 D0 0C")
 CMD_DISCOVER_A = bytes.fromhex("21 03 03 01 00 01")
 CMD_DEACT_IDLE = bytes.fromhex("21 06 01 00")
 
@@ -335,6 +338,7 @@ class PN7160Reader:
         transport.__enter__()
         try:
             transport.reset_init()
+            self._check_pmu_config()
             transport.discover()
         except BaseException:
             transport.__exit__(*sys.exc_info())
@@ -343,6 +347,26 @@ class PN7160Reader:
 
     def __exit__(self, *exc):
         return self._transport.__exit__(*exc)
+
+    def _check_pmu_config(self):
+        transport = self._transport
+        try:
+            transport.write(CMD_GET_PMU_CFG)
+            response = transport.wait_for(b"\x40\x03")
+            prefix_length = len(PMU_CFG_RESPONSE_PREFIX)
+            if (not response.startswith(PMU_CFG_RESPONSE_PREFIX)
+                    or len(response) != prefix_length + len(ELECHOUSE_5V_PMU_CFG)):
+                raise NFCError(f"Unexpected PMU_CFG response: {hexstr(response)}")
+        except (NFCError, OSError) as exc:
+            self._report(f"WARNING PN7160 PMU_CFG read failed: {exc}")
+            return
+
+        config = response[prefix_length:]
+        if config != ELECHOUSE_5V_PMU_CFG:
+            self._report(
+                f"WARNING PN7160 PMU_CFG differs from Elechouse 5 V reference: "
+                f"read {hexstr(config)}, expected {hexstr(ELECHOUSE_5V_PMU_CFG)}"
+            )
 
     def _schedule(self, reason, delay=0.75, reset=False):
         self._uid = None
